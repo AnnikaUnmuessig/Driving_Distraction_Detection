@@ -3,3 +3,6 @@ transformers
 Pillow
 numpy
 opencv-python
+evaluate
+scikit-learn
+huggingface_hub
