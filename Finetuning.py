@@ -8,10 +8,17 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 from transformers import Trainer, default_data_collator
 import os
+import evaluate
+
+metric = evaluate.load("accuracy")
 
 #Fixed variables
 num_frames = 96
 
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    predictions = np.argmax(predictions, axis=1)
+    return metric.compute(predictions=predictions, references=labels)
 
 class DrivingDistractionDataset(Dataset):
     def __init__(self, csv_file, processor, num_frames=96):
@@ -65,13 +72,19 @@ train_dataset = DrivingDistractionDataset(csv_file="DMD_dataset/train.csv", proc
 val_dataset = DrivingDistractionDataset(csv_file="DMD_dataset/val.csv", processor=processor, num_frames=num_frames)
 test_dataset = DrivingDistractionDataset(csv_file="DMD_dataset/test.csv", processor=processor, num_frames=num_frames)
 
+sample = train_dataset[0]
+print("Shape:", sample['pixel_values'].shape)       # expect [96, 3, 224, 224] or similar
+print("Label:", sample['labels'])                   # expect 0-10
+print("NaN?", torch.isnan(sample['pixel_values']).any())  # expect False
+print("Min/Max:", sample['pixel_values'].min().item(), sample['pixel_values'].max().item())
+
 training_args = TrainingArguments(
     output_dir="./timesformer-L-96",
     remove_unused_columns=False,
     per_device_train_batch_size=4,
     gradient_accumulation_steps=16,    
     gradient_checkpointing=True,        
-    fp16=True,                        
+    fp16=False,                        
     learning_rate=2e-5,                 
     num_train_epochs=5,
     logging_steps=1,
@@ -88,6 +101,7 @@ trainer = Trainer(
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
+    compute_metrics=compute_metrics,
     data_collator=default_data_collator, # Crucial for stacking pixel_values
 )
 
