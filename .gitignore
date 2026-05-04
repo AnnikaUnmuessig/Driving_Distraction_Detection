@@ -1,2 +1,4 @@
 data/*
 DMD_dataset/
+notebooks/config.json
+env

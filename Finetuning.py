@@ -16,12 +16,15 @@ Environment variables (set in sbatch or locally):
 import os
 import random
 import cv2
+import json
 import numpy as np
 import torch
 import evaluate
+import matplotlib.pyplot as plt
+import seaborn as sns
 from PIL import Image
 from collections import Counter, defaultdict
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, confusion_matrix
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from transformers import (
     AutoImageProcessor,
@@ -29,6 +32,7 @@ from transformers import (
     TrainingArguments,
     Trainer,
     default_data_collator,
+    EarlyStoppingCallback,
 )
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -39,7 +43,7 @@ DATASET_PATH = os.environ.get("DATASET_PATH", "./distraction_dataset")
 OUTPUT_DIR   = os.environ.get("OUTPUT_DIR",   "./timesformer-hr-16")
 
 NUM_FRAMES = 16     # TimeSformer-HR native frame count
-LIMIT_CAP  = 120    # Max clips per class — keeps training balanced while new data is added
+LIMIT_CAP  = 160    # Max clips per class — keeps training balanced while new data is added
                     # Set to None to disable capping
 SEED       = 42
 
@@ -240,7 +244,7 @@ def main():
         raise RuntimeError(f"No video files found under {DATASET_PATH}. "
                            "Did you run download_assets.py first?")
 
-    train_entries, val_entries, test_entries = stratified_split(entries, seed=SEED)
+    train_entries, val_entries, test_entries = stratified_split(entries, train_ratio=0.7, val_ratio=0.2, seed=SEED)
     print(f"\nSplit sizes — Train: {len(train_entries)} | "
           f"Val: {len(val_entries)} | Test: {len(test_entries)}")
 
@@ -273,11 +277,9 @@ def main():
         weight_decay=0.01,
 
         # Logging & evaluation
-        logging_steps=10,
-        eval_strategy="steps",
-        eval_steps=100,
-        save_strategy="steps",
-        save_steps=100,
+        logging_strategy="epoch",
+        eval_strategy="epoch",
+        save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="accuracy",
         greater_is_better=True,
@@ -299,6 +301,7 @@ def main():
         eval_dataset=val_dataset,
         data_collator=default_data_collator,
         compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
     )
 
     # ── Train ─────────────────────────────────────────────────────────────────
@@ -307,10 +310,36 @@ def main():
 
     # ── Final evaluation on test set ──────────────────────────────────────────
     print("\nEvaluating on test set...")
-    test_results = trainer.evaluate(test_dataset)
-    print("Test results:")
-    for k, v in test_results.items():
+    test_results = trainer.predict(test_dataset)
+    print("Test metrics:")
+    for k, v in test_results.metrics.items():
         print(f"  {k}: {v}")
+
+    # Generate Confusion Matrix
+    print("\nGenerating confusion matrix...")
+    preds = np.argmax(test_results.predictions, axis=1)
+    labels = test_results.label_ids
+    cm = confusion_matrix(labels, preds)
+    
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=[ID2LABEL[i] for i in range(NUM_CLASSES)],
+                yticklabels=[ID2LABEL[i] for i in range(NUM_CLASSES)])
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.title('Confusion Matrix on Test Set')
+    plt.tight_layout()
+    cm_path = os.path.join(OUTPUT_DIR, "confusion_matrix.png")
+    plt.savefig(cm_path)
+    plt.close()
+    print(f"Confusion matrix saved to {cm_path}")
+
+    # Save training history
+    log_history = trainer.state.log_history
+    log_path = os.path.join(OUTPUT_DIR, "training_metrics.json")
+    with open(log_path, "w") as f:
+        json.dump(log_history, f, indent=4)
+    print(f"Training metrics history saved to {log_path}")
 
     # ── Save best model ───────────────────────────────────────────────────────
     best_model_dir = os.path.join(OUTPUT_DIR, "best_model")

@@ -6,3 +6,5 @@ opencv-python
 evaluate
 scikit-learn
 huggingface_hub
+matplotlib
+seaborn

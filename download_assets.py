@@ -20,7 +20,7 @@ import os
 from huggingface_hub import snapshot_download
 
 MODEL_REPO   = "facebook/timesformer-hr-finetuned-k400"
-DATASET_REPO = "endoard/distraction_dataset"
+DATASET_REPO = "endoard/distraction_detection_dataset"
 
 
 def download_model(output_dir):
