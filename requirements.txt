@@ -7,3 +7,4 @@ evaluate
 scikit-learn
 huggingface_hub
 elevenlabs
+ultralytics
