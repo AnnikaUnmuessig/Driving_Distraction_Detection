@@ -33,7 +33,22 @@ from transformers import (
     Trainer,
     default_data_collator,
     EarlyStoppingCallback,
+    TrainerCallback,
 )
+
+class CustomLoggingCallback(TrainerCallback):
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        print(f"\n[{state.epoch + 1:.0f}/{args.num_train_epochs}] >>> Inizio Epoca...")
+        
+    def on_epoch_end(self, args, state, control, **kwargs):
+        print(f"[{state.epoch:.0f}/{args.num_train_epochs}] <<< Epoca Terminata.")
+        
+    def on_save(self, args, state, control, **kwargs):
+        print(f"Checkpoint salvato allo step {state.global_step}.")
+        
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is not None and "loss" in logs:
+            print(f"Metriche: {logs}")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -262,10 +277,10 @@ def main():
         output_dir=OUTPUT_DIR,
         remove_unused_columns=False,
 
-        # Batch / accumulation: effective batch = 2 * 8 = 16 per GPU
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=8,
+        # Batch / accumulation: effective batch = 4 * 4 = 16 per GPU
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=4,
         gradient_checkpointing=True,
         fp16=True,
 
@@ -273,7 +288,7 @@ def main():
         learning_rate=2e-5,
         num_train_epochs=10,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.1,
+        warmup_steps=100,
         weight_decay=0.01,
 
         # Logging & evaluation
@@ -285,7 +300,8 @@ def main():
         greater_is_better=True,
         save_total_limit=3,
 
-        dataloader_num_workers=4,
+        dataloader_num_workers=2,
+        disable_tqdm=True,
 
         # W&B — set WANDB_MODE=offline in sbatch if no internet on compute node
         report_to="wandb",
@@ -301,7 +317,7 @@ def main():
         eval_dataset=val_dataset,
         data_collator=default_data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5), CustomLoggingCallback()],
     )
 
     # ── Train ─────────────────────────────────────────────────────────────────
