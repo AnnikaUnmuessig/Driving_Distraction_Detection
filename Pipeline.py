@@ -183,4 +183,4 @@ def run_pipeline(video_path=None):
         print(f"✅ Done. Annotated video saved to: {output_path}")
     cv2.destroyAllWindows()
 
-run_pipeline("test_data/test_video2.mp4")
+run_pipeline("test_data/test_video.mp4")

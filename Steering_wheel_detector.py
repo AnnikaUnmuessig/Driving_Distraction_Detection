@@ -84,10 +84,11 @@ def detect_steering_and_hands(image_path):
     # 1. Detect Steering Wheel (YOLO/Roboflow)
     output = model.predict(image_path, confidence=40).json()
     steering_box = None
+    x1 = y1 = x2 = y2 = 0
     if output['predictions']:
         pred = output['predictions'][0]
         x_center, y_center, w, h = pred['x'], pred['y'], pred['width'], pred['height']
-        x1, y1, x2, y2 = (int(x_center - w/2), int(y_center - h/2), 
+        x1, y1, x2, y2 = (int(x_center - w/2), int(y_center - h/2),
                           int(x_center + w/2), int(y_center + h/2))
         steering_box = (x1, y1, x2, y2)
 
@@ -113,7 +114,7 @@ def detect_steering_and_hands(image_path):
                     1 for lm in hand_lms
                     if x1 <= (lm.x * img_w) <= x2 and y1 <= (lm.y * img_h) <= y2
                 )
-                is_inside = landmarks_inside >= 2 # At least 5 landmarks inside to consider "on wheel"
+                is_inside = landmarks_inside >= 2
 
             detected_hands.append({
                 "hand_lms": hand_lms,
@@ -129,28 +130,23 @@ def detect_steering_and_hands(image_path):
         scores = [h["score"] for h in detected_hands]
 
         if labels[0] != labels[1] and min(scores) > 0.75:
-            # High confidence distinct labels -> apply mirroring fix (swap)
             for hand in detected_hands:
                 hand["label"] = "Right" if hand["raw_label"] == "Right" else "Left"
         else:
-            # Conflicting or low confidence -> use geometry (Vertical position on wheel)
             detected_hands.sort(key=lambda h: h["wrist_y"])
-            detected_hands[0]["label"] = "Left"   # Physically higher in frame
-            detected_hands[1]["label"] = "Right"  # Physically lower in frame
+            detected_hands[0]["label"] = "Left"
+            detected_hands[1]["label"] = "Right"
 
     elif len(detected_hands) == 1:
-            hand = detected_hands[0]
-            # Always flip the label (to fix the mirroring) 
-            # but only apply the 'ON' status to that specific hand
-            hand["label"] = "Right" if hand["raw_label"] == "Right" else "Left"
-            
-            # We explicitly ensure the OTHER hand is False
-            if hand["label"] == "Left":
-                left_on = hand["is_inside"]
-                right_on = False
-            else:
-                right_on = hand["is_inside"]
-                left_on = False
+        hand = detected_hands[0]
+        hand["label"] = "Right" if hand["raw_label"] == "Right" else "Left"
+
+        if hand["label"] == "Left":
+            left_on = hand["is_inside"]
+            right_on = False
+        else:
+            right_on = hand["is_inside"]
+            left_on = False
 
     # Final assignment based on processed labels
     for hand in detected_hands:
@@ -158,27 +154,48 @@ def detect_steering_and_hands(image_path):
             if hand["label"] == "Left": left_on = True
             elif hand["label"] == "Right": right_on = True
 
-    """
-    # 4. Visualization
-    annotated_image = draw_landmarks_on_image(rgb_frame, hand_result)
-    annotated_image = draw_pose_markers(annotated_image, pose_result, img_w, img_h)
+    # 4. FALLBACK: Use pose wrist landmarks for any undetected hand
+    #    This handles occlusion cases where a hand is hidden behind the steering wheel.
+    #    Pose landmarks indices: 15=L_Wrist, 16=R_Wrist
+    POSE_WRIST_INDICES = {"Left": 15, "Right": 16}
+    POSE_VISIBILITY_THRESHOLD = 0.4
 
-    if steering_box:
-        cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 255, 0), 8)
+    if steering_box and pose_result.pose_landmarks:
+        lms = pose_result.pose_landmarks[0]
 
-    status_y = 100
-    for side, is_on in [("LEFT", left_on), ("RIGHT", right_on)]:
-        text = f"{side} HAND: {'ON' if is_on else 'OFF'}"
-        color = (0, 255, 0) if is_on else (0, 0, 255)
-        cv2.putText(annotated_image, text, (50, status_y), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 6)
-        status_y += 100
+        for side, current_status in [("Left", left_on), ("Right", right_on)]:
+            if current_status:
+                # Hand was already confirmed ON by MediaPipe — no fallback needed
+                continue
 
-    plt.figure(figsize=(15, 10))
-    plt.imshow(annotated_image[:, :, ::-1])
-    plt.axis('off')
-    #plt.show()
-    """
+            # Check if this side was detected at all by MediaPipe
+            side_detected = any(
+                h.get("label") == side for h in detected_hands
+            )
+
+            if side_detected:
+                # MediaPipe found this hand but ruled it OFF — respect that
+                continue
+
+            # Hand not detected at all (likely occluded): fall back to pose wrist
+            wrist_lm = lms[POSE_WRIST_INDICES[side]]
+            if wrist_lm.visibility < POSE_VISIBILITY_THRESHOLD:
+                print(f"[Fallback] {side} wrist pose landmark not visible enough, skipping.")
+                continue
+
+            wrist_px = wrist_lm.x * img_w
+            wrist_py = wrist_lm.y * img_h
+            wrist_in_box = x1 <= wrist_px <= x2 and y1 <= wrist_py <= y2
+
+            print(f"[Fallback] {side} hand not detected by MediaPipe. "
+                  f"Pose wrist at ({wrist_px:.0f}, {wrist_py:.0f}), "
+                  f"in box: {wrist_in_box}")
+
+            if side == "Left":
+                left_on = wrist_in_box
+            else:
+                right_on = wrist_in_box
+
     return {
         "steering_box": steering_box,
         "left_hand_on": left_on,
