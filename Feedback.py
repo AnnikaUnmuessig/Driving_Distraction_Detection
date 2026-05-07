@@ -12,7 +12,7 @@ api_key = os.environ.get("GROQ_API_KEY")
 from groq import Groq
 groq_client = Groq(api_key=api_key)
 
-distraction_output = {"distracted": "yes", "distraction_type": "texting", "type of warning": "heavy"}
+#distraction_output = {"distracted": "yes", "distraction_type": "texting", "type of warning": "heavy"}
 
 import time
 import io
@@ -21,7 +21,7 @@ from pydub import AudioSegment
 from pydub.playback import play
 
 
-def generate_safety_alert_all_groq():
+def generate_safety_alert_all_groq(distraction_output):
     start_time = time.time()
     
     # 1. LLM Generation (Non-streaming for TTS input)
@@ -67,4 +67,4 @@ def generate_safety_alert_all_groq():
     print(f"Total Latency:   {total_time:.3f}s")
 
 
-generate_safety_alert_all_groq()
+#generate_safety_alert_all_groq()

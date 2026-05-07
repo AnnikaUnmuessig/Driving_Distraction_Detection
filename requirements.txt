@@ -8,3 +8,4 @@ scikit-learn
 huggingface_hub
 elevenlabs
 ultralytics
+python-dotenv
