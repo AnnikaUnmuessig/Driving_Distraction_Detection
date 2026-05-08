@@ -38,17 +38,31 @@ from transformers import (
 
 class CustomLoggingCallback(TrainerCallback):
     def on_epoch_begin(self, args, state, control, **kwargs):
-        print(f"\n[{state.epoch + 1:.0f}/{args.num_train_epochs}] >>> Inizio Epoca...")
-        
+        epoch_num = int(state.epoch) + 1
+        print(f"\n{'='*60}")
+        print(f"  Epoca {epoch_num}/{int(args.num_train_epochs)} — step globale: {state.global_step}")
+        print(f"{'='*60}")
+
     def on_epoch_end(self, args, state, control, **kwargs):
-        print(f"[{state.epoch:.0f}/{args.num_train_epochs}] <<< Epoca Terminata.")
-        
+        epoch_num = int(state.epoch)
+        # Collect the latest logged metrics for this epoch
+        metrics = {}
+        for entry in reversed(state.log_history):
+            if "loss" in entry or "eval_loss" in entry:
+                metrics = entry
+                break
+        loss_str = f"loss={metrics.get('loss', '?'):.4f}" if "loss" in metrics else ""
+        eval_str = f"eval_loss={metrics.get('eval_loss', '?'):.4f}" if "eval_loss" in metrics else ""
+        acc_str  = f"acc={metrics.get('eval_accuracy', '?'):.4f}" if "eval_accuracy" in metrics else ""
+        parts = [s for s in [loss_str, eval_str, acc_str] if s]
+        print(f"  ✓ Epoca {epoch_num}/{int(args.num_train_epochs)} completata  |  {' | '.join(parts)}")
+
     def on_save(self, args, state, control, **kwargs):
-        print(f"Checkpoint salvato allo step {state.global_step}.")
-        
+        print(f"  💾 Checkpoint salvato allo step {state.global_step}.")
+
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is not None and "loss" in logs:
-            print(f"Metriche: {logs}")
+        # Already shown by Trainer's tqdm bar — suppress duplicate output
+        pass
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -301,7 +315,7 @@ def main():
         save_total_limit=3,
 
         dataloader_num_workers=2,
-        disable_tqdm=True,
+        disable_tqdm=False,
 
         # W&B — set WANDB_MODE=offline in sbatch if no internet on compute node
         report_to="wandb",

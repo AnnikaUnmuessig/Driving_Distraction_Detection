@@ -26,6 +26,7 @@ import os
 import random
 from tqdm.auto import tqdm
 from huggingface_hub import snapshot_download, hf_hub_download, HfApi
+import huggingface_hub.utils as hf_utils
 
 MODEL_REPO   = "facebook/timesformer-hr-finetuned-k400"
 DATASET_REPO = "endoard/distraction_detection_dataset"
@@ -91,10 +92,6 @@ def download_dataset_partial(output_dir, videos_per_class, seed=42):
     """
     dataset_dir = os.path.join(output_dir, "distraction_dataset")
     os.makedirs(dataset_dir, exist_ok=True)
-
-    # Suppress the verbose per-chunk progress bars emitted by huggingface_hub.
-    # We replace them with a single outer bar below.
-    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
     print(f"\n[2/2] Listing files in dataset repo '{DATASET_REPO}'...")
     api = HfApi()
@@ -190,6 +187,10 @@ def main():
         help="Random seed for file selection when --videos_per_class is set. (default: 42)",
     )
     args = parser.parse_args()
+
+    # Disable ALL huggingface_hub internal progress bars (per-chunk tqdm).
+    # Must be called here, after import, before any download — env vars are too late.
+    hf_utils.disable_progress_bars()
 
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
