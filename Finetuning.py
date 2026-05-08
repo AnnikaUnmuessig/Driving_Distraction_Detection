@@ -76,6 +76,14 @@ LIMIT_CAP  = 160    # Max clips per class — keeps training balanced while new 
                     # Set to None to disable capping
 SEED       = 42
 
+# ── Batch / accumulation (configurable via env vars) ───────────────────────────
+# Kaggle T4 (15 GB):  TRAIN_BATCH_SIZE=1  GRAD_ACCUM_STEPS=16  → effective 16
+# CINECA A100 (40 GB): TRAIN_BATCH_SIZE=4  GRAD_ACCUM_STEPS=4   → effective 16
+# Default is conservative (batch=1) so the script runs on any GPU without edits.
+PER_DEVICE_TRAIN_BATCH = int(os.environ.get("TRAIN_BATCH_SIZE", "1"))
+PER_DEVICE_EVAL_BATCH  = int(os.environ.get("EVAL_BATCH_SIZE",  "1"))
+GRAD_ACCUM_STEPS       = int(os.environ.get("GRAD_ACCUM_STEPS", "16"))
+
 # 11 classes consistent with Data_preparation.py
 # (reach_backseat, stand_still_waiting, unclassified are excluded intentionally)
 CLASS_MAP = {
@@ -291,10 +299,11 @@ def main():
         output_dir=OUTPUT_DIR,
         remove_unused_columns=False,
 
-        # Batch / accumulation: effective batch = 4 * 4 = 16 per GPU
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
-        gradient_accumulation_steps=4,
+        # Batch / accumulation — effective batch = TRAIN_BATCH * GRAD_ACCUM (default: 1*16=16)
+        # Override via env vars: TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE, GRAD_ACCUM_STEPS
+        per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH,
+        per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH,
+        gradient_accumulation_steps=GRAD_ACCUM_STEPS,
         gradient_checkpointing=True,
         fp16=True,
 
@@ -335,7 +344,13 @@ def main():
     )
 
     # ── Train ─────────────────────────────────────────────────────────────────
-    print("\nStarting training...")
+    # Reduce memory fragmentation on consumer GPUs (T4, V100)
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    torch.cuda.empty_cache()
+
+    print(f"\nStarting training...")
+    print(f"  Batch/device={PER_DEVICE_TRAIN_BATCH}  GradAccum={GRAD_ACCUM_STEPS}  "
+          f"EffectiveBatch={PER_DEVICE_TRAIN_BATCH * GRAD_ACCUM_STEPS}")
     trainer.train()
 
     # ── Final evaluation on test set ──────────────────────────────────────────
