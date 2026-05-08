@@ -24,6 +24,7 @@ Example on CINECA Leonardo ($WORK is persistent storage):
 import argparse
 import os
 import random
+from tqdm.auto import tqdm
 from huggingface_hub import snapshot_download, hf_hub_download, HfApi
 
 MODEL_REPO   = "facebook/timesformer-hr-finetuned-k400"
@@ -85,10 +86,15 @@ def download_dataset_partial(output_dir, videos_per_class, seed=42):
       1. List all files in the HF dataset repo.
       2. Group them by top-level folder (= class name).
       3. Shuffle and keep only `videos_per_class` per class.
-      4. Download each file individually via hf_hub_download.
+      4. Download each file individually via hf_hub_download,
+         using a single tqdm bar (HF's per-file bars are suppressed).
     """
     dataset_dir = os.path.join(output_dir, "distraction_dataset")
     os.makedirs(dataset_dir, exist_ok=True)
+
+    # Suppress the verbose per-chunk progress bars emitted by huggingface_hub.
+    # We replace them with a single outer bar below.
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
     print(f"\n[2/2] Listing files in dataset repo '{DATASET_REPO}'...")
     api = HfApi()
@@ -107,28 +113,36 @@ def download_dataset_partial(output_dir, videos_per_class, seed=42):
         if top_folder in by_class and ext in VIDEO_EXTENSIONS:
             by_class[top_folder].append(filepath)
 
-    total_to_download = 0
+    # Build flat download list and print per-class summary
     plan: dict[str, list[str]] = {}
+    flat_list: list[tuple[str, str]] = []   # (class_name, repo_path)
     for cls, files in by_class.items():
         rng.shuffle(files)
         selected = files[:videos_per_class]
         plan[cls] = selected
-        total_to_download += len(selected)
+        flat_list.extend((cls, p) for p in selected)
         print(f"  {cls:25s}: {len(selected):4d} / {len(files)} videos selected")
 
-    print(f"\n  Total files to download: {total_to_download}")
-    print(f"  Destination: {dataset_dir}\n")
+    total = len(flat_list)
+    print(f"\n  Total: {total} videos  |  Destination: {dataset_dir}")
 
+    # ── Single progress bar for the entire download ────────────────────────────
     downloaded = 0
-    for cls, files in plan.items():
-        cls_dir = os.path.join(dataset_dir, cls)
-        os.makedirs(cls_dir, exist_ok=True)
-        for repo_path in files:
+    errors = 0
+    with tqdm(total=total, unit="video", desc="Downloading", dynamic_ncols=True) as pbar:
+        for cls, repo_path in flat_list:
             filename = os.path.basename(repo_path)
-            dest_path = os.path.join(cls_dir, filename)
+            dest_path = os.path.join(dataset_dir, cls, filename)
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+            # Update description before each download so class is visible
+            pbar.set_description(f"Downloading [{cls}]")
+
             if os.path.exists(dest_path):
                 downloaded += 1
+                pbar.update(1)
                 continue
+
             try:
                 hf_hub_download(
                     repo_id=DATASET_REPO,
@@ -137,11 +151,16 @@ def download_dataset_partial(output_dir, videos_per_class, seed=42):
                     local_dir=dataset_dir,
                 )
                 downloaded += 1
-                print(f"  [{downloaded}/{total_to_download}] {repo_path}")
             except Exception as e:
-                print(f"  [WARN] Failed to download {repo_path}: {e}")
+                errors += 1
+                tqdm.write(f"[WARN] Failed: {repo_path} — {e}")
 
-    print(f"\n  Done. {downloaded} files saved to {dataset_dir}")
+            pbar.update(1)
+
+    status = f"{downloaded}/{total} downloaded"
+    if errors:
+        status += f", {errors} errors"
+    print(f"\n  Done. {status}. Saved to {dataset_dir}")
     return dataset_dir
 
 
