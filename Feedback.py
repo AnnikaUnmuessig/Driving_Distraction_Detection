@@ -5,6 +5,7 @@ from huggingface_hub import login
 import torch
 import time
 import os
+import simpleaudio as sa
 api_key = os.environ.get("GROQ_API_KEY")
 
 
@@ -52,19 +53,30 @@ def generate_safety_alert_all_groq(distraction_output):
 
     # 3. Playback - FIX START
     # Use .read() to get the bytes from the BinaryAPIResponse
-    raw_audio_bytes = tts_response.read() 
-    
+    raw_audio_bytes = tts_response.read()
     audio_data = io.BytesIO(raw_audio_bytes)
     audio_segment = AudioSegment.from_wav(audio_data)
+
+    # Convert to simpleaudio-compatible format
+    audio_segment = audio_segment.set_frame_rate(44100).set_channels(1).set_sample_width(2)
+    wav_io = io.BytesIO()
+    audio_segment.export(wav_io, format="wav")
+    wav_io.seek(0)
+
+    wave_obj = sa.WaveObject.from_wave_file(wav_io)
+    play_obj = wave_obj.play()
+    play_obj.wait_done()
+    print("Playing Alert...") # This happens in your speakers
     
-    print("Playing Alert...")
-    play(audio_segment)
     
     total_time = time.time() - start_time
     print(f"\n--- Performance Breakdown ---")
     print(f"LLM Generation: {llm_done - start_time:.3f}s")
     print(f"TTS Synthesis:  {tts_done - llm_done:.3f}s")
     print(f"Total Latency:   {total_time:.3f}s")
+    return raw_audio_bytes
+    
+
 
 
 #generate_safety_alert_all_groq()

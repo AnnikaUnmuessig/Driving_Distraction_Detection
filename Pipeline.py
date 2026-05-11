@@ -1,20 +1,147 @@
-#This is the final pipeline
+# This is the final pipeline
 import cv2
 import time
-from Steering_wheel_detector import detect_steering_and_hands, draw_landmarks_on_image,draw_pose_markers
+import threading
+import os
+import subprocess
+from Steering_wheel_detector import detect_steering_and_hands, draw_landmarks_on_image, draw_pose_markers
 from Feedback import generate_safety_alert_all_groq
 
-#Fixed variables
-HANDS_OFF_THRESHOLD = 5        # seconds
+# Fixed variables
+HANDS_OFF_THRESHOLD = 1        # seconds temporarily low
 WHEEL_DETECTION_INTERVAL = 1   # seconds
 TIMESFORMER_WINDOW_SIZE = 16   # number of frames for action classification
 ACTION_OVERLAP = 8             # start new action classification every 8 frames
-DEBOUNCE_THRESHOLD = 3          # number of consecutive detections to confirm state change
+DEBOUNCE_THRESHOLD = 3         # number of consecutive detections to confirm state change
 
-#Dummy action classifier 
+# Dummy action classifier
 def classify_action(frames_buffer):
-    #placeholder
+    # placeholder
     return None
+
+
+def build_audio_track(alert_log, total_duration_seconds):
+    """
+    Mixes all in-memory audio clips into a single raw PCM stream using FFmpeg.
+    Each clip is delayed to its alert timestamp, then all are amixed together.
+    The result is trimmed to total_duration_seconds so audio never outlasts the video.
+
+    alert_log : list of (video_timestamp_seconds: float, audio_bytes: bytes)
+                audio_bytes must be a valid encoded audio file (e.g. MP3 from Groq TTS)
+    Returns   : raw PCM bytes (s16le, 44100 Hz, stereo) or None on failure
+    """
+    if not alert_log:
+        return None
+
+    # One anonymous OS pipe per clip — FFmpeg reads the read-end, parent writes the write-end
+    pipe_pairs = []
+    for _ in alert_log:
+        r, w = os.pipe()
+        pipe_pairs.append((r, w))
+
+    read_fds = [r for r, _ in pipe_pairs]
+
+    # Build FFmpeg command
+    cmd = ["ffmpeg", "-y"]
+    for r_fd in read_fds:
+        cmd += ["-i", f"pipe:{r_fd}"]
+
+    filter_parts = []
+    for i, (ts, _) in enumerate(alert_log):
+        delay_ms = int(ts * 1000)
+        filter_parts.append(f"[{i}:a]adelay={delay_ms}|{delay_ms}[a{i}]")
+
+    mix_inputs = "".join(f"[a{i}]" for i in range(len(alert_log)))
+    filter_parts.append(
+        f"{mix_inputs}amix=inputs={len(alert_log)}:normalize=0:dropout_transition=0[aout]"
+    )
+
+    cmd += [
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "[aout]",
+        "-t", str(total_duration_seconds),  # hard trim to video length
+        "-ar", "44100",
+        "-ac", "2",
+        "-f", "s16le",                      # raw PCM — no container overhead
+        "pipe:1"
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=tuple(read_fds)
+        )
+
+        # Write each clip into its pipe's write-end in a background thread.
+        # Must be threaded to avoid deadlocking while FFmpeg reads simultaneously.
+        def write_clip(w_fd, audio_bytes):
+            try:
+                with os.fdopen(w_fd, "wb") as f:
+                    f.write(audio_bytes)
+            except BrokenPipeError:
+                pass  # FFmpeg finished early (e.g. clip longer than -t) — that's fine
+
+        writers = []
+        for (r_fd, w_fd), (_, audio_bytes) in zip(pipe_pairs, alert_log):
+            os.close(r_fd)  # close the read-end in the parent; FFmpeg holds its copy
+            t = threading.Thread(target=write_clip, args=(w_fd, audio_bytes), daemon=True)
+            t.start()
+            writers.append(t)
+
+        pcm_bytes, stderr = proc.communicate()
+
+        for t in writers:
+            t.join(timeout=5)
+
+        if proc.returncode != 0:
+            print(f"❌ Audio mix failed:\n{stderr.decode(errors='replace')}")
+            return None
+
+        print(f"✅ Mixed audio track: {len(pcm_bytes):,} PCM bytes")
+        return pcm_bytes
+
+    except Exception as e:
+        print(f"❌ build_audio_track exception: {e}")
+        for r, w in pipe_pairs:
+            for fd in (r, w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        return None
+
+
+def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_duration_seconds):
+    """
+    Pipes raw PCM bytes into FFmpeg as the audio stream and muxes with the silent video.
+    Audio is hard-trimmed to total_duration_seconds. No temp files are written.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", silent_video_path,    # video from file
+        "-f", "s16le",              # raw PCM from stdin
+        "-ar", "44100",
+        "-ac", "2",
+        "-i", "pipe:0",
+        "-map", "0:v",
+        "-map", "1:a",
+        "-c:v", "copy",             # no video re-encode
+        "-c:a", "aac",
+        "-t", str(total_duration_seconds),
+        "-shortest",
+        final_output_path
+    ]
+
+    try:
+        subprocess.run(cmd, input=pcm_bytes, capture_output=True, check=True)
+        print(f"✅ Final video with audio saved to: {final_output_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ FFmpeg mux failed:\n{e.stderr.decode(errors='replace')}")
+        os.rename(silent_video_path, final_output_path)
+        print(f"⚠️  Falling back to silent video: {final_output_path}")
 
 
 def run_pipeline(video_path=None):
@@ -27,13 +154,18 @@ def run_pipeline(video_path=None):
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Set up VideoWriter (only when processing a file)
+    # VideoWriter — silent for now; audio is muxed in at the end
     out = None
+    silent_output_path = None
     if video_path:
-        output_path = video_path.rsplit(".", 1)[0] + "_annotated.mp4"
+        silent_output_path = video_path.rsplit(".", 1)[0] + "_annotated_silent.mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(output_path, fourcc, fps, (frame_w, frame_h))
-        print(f"Saving annotated video to: {output_path}")
+        out = cv2.VideoWriter(silent_output_path, fourcc, fps, (frame_w, frame_h))
+        print(f"Saving annotated video (silent) to: {silent_output_path}")
+
+    # In-memory alert log: list of (video_timestamp_seconds, audio_bytes)
+    alert_log = []
+    alert_log_lock = threading.Lock()
 
     # State tracking
     hands_off_since = None
@@ -41,13 +173,64 @@ def run_pipeline(video_path=None):
     frames_buffer = []
     frame_count = 0
     last_action_frame = -ACTION_OVERLAP
-    last_annotated_frame = None   # Cache last annotated frame between wheel checks
-    last_status_text = []         # Cache status overlays between checks
+    last_annotated_frame = None
+    last_status_text = []
 
     # Debounce state
     confirmed_hand_state = {"left": True, "right": True}
     pending_hand_state = None
     pending_count = 0
+
+    # Alert threading state
+    alert_lock = threading.Lock()
+    alert_active = False
+
+    def fire_alert(distraction_output, video_timestamp):
+        """
+        Background thread: calls generate_safety_alert_all_groq and stores
+        the returned audio bytes in alert_log.
+
+        ── Required change in Feedback.py ─────────────────────────────────
+        generate_safety_alert_all_groq must RETURN the TTS audio as bytes:
+
+            audio_bytes = groq_client.audio.speech.create(...).content
+            # optionally still play it here
+            return audio_bytes   # <-- this is the only required addition
+        ────────────────────────────────────────────────────────────────────
+        """
+        nonlocal alert_active
+        try:
+            audio_bytes = generate_safety_alert_all_groq(distraction_output)
+
+            if isinstance(audio_bytes, bytes) and len(audio_bytes) > 0:
+                with alert_log_lock:
+                    alert_log.append((video_timestamp, audio_bytes))
+                print(f"🔊 Alert audio captured ({len(audio_bytes):,} bytes) @ {video_timestamp:.2f}s")
+            else:
+                print("⚠️  generate_safety_alert_all_groq returned no bytes — add 'return audio_bytes' in Feedback.py")
+
+        except Exception as e:
+            print(f"❌ Alert failed: {e}")
+        finally:
+            with alert_lock:
+                alert_active = False
+
+    def trigger_alert(distraction_output):
+        """Thread-safe alert trigger. Drops the alert if one is already in flight."""
+        nonlocal alert_active
+        with alert_lock:
+            if alert_active:
+                return False
+            alert_active = True
+
+        video_timestamp = frame_count / fps
+
+        threading.Thread(
+            target=fire_alert,
+            args=(distraction_output, video_timestamp),
+            daemon=True
+        ).start()
+        return True
 
     print("Pipeline running. Press 'q' to quit.")
 
@@ -83,25 +266,21 @@ def run_pipeline(video_path=None):
 
             # ── Debounce logic ──
             if new_state == confirmed_hand_state:
-                # Result matches confirmed state — reset any pending change
                 pending_hand_state = None
                 pending_count = 0
             elif new_state == pending_hand_state:
-                # Same change seen again — increment counter
                 pending_count += 1
                 if pending_count >= DEBOUNCE_THRESHOLD:
-                    # Change confirmed, commit it
                     print(f"State change confirmed: {confirmed_hand_state} → {new_state}")
                     confirmed_hand_state = new_state
                     pending_hand_state = None
                     pending_count = 0
             else:
-                # New candidate change — start tracking it
                 pending_hand_state = new_state
                 pending_count = 1
 
-            # ── Use confirmed_hand_state for alert logic (not raw result) ──
-            hands_on_wheel = confirmed_hand_state["left"] or confirmed_hand_state["right"]
+            # ── Use confirmed_hand_state for alert logic ──
+            hands_on_wheel = confirmed_hand_state["left"] and confirmed_hand_state["right"]
 
             if hands_on_wheel:
                 hands_off_since = None
@@ -113,15 +292,22 @@ def run_pipeline(video_path=None):
                 print(f"Hands off wheel for {hands_off_duration:.1f}s")
 
                 if hands_off_duration >= HANDS_OFF_THRESHOLD:
-                    print("⚠️  ALERT: Hands off wheel too long!")
-                    distraction_output = {
+                    # Try to trigger the alert
+                    alert_was_fired = trigger_alert({
                         "distracted": "yes",
                         "distraction_type": "hands off wheel",
                         "type of warning": "mid-heavy"
-                    }
-                    generate_safety_alert_all_groq(distraction_output)
-                    hands_off_since = current_time
-                    last_status_text.append(("⚠ HANDS OFF WHEEL", (0, 0, 255)))
+                    })
+
+                    # CRITICAL FIX: Whether the alert fired or was blocked by 'alert_active',
+                    # we MUST reset the hands_off_since timer. 
+                    # This forces the driver to wait another full HANDS_OFF_THRESHOLD 
+                    # before the system even considers alerting again.
+                    hands_off_since = current_time 
+                    
+                    if alert_was_fired:
+                        print("📢 Alert started - Blocking new triggers until voice finishes.")
+
         # ── 2. ACTION CLASSIFICATION ──
         frames_buffer.append(frame)
         if len(frames_buffer) > TIMESFORMER_WINDOW_SIZE:
@@ -135,20 +321,16 @@ def run_pipeline(video_path=None):
 
             if action:
                 print(f"⚠️  Distraction detected: {action}")
-                distraction_output = {
+                trigger_alert({
                     "distracted": "yes",
                     "distraction_type": action,
                     "type of warning": "light-mid"
-                }
-                generate_safety_alert_all_groq(distraction_output)
+                })
                 last_status_text.append((f"⚠ {action.upper()}", (0, 165, 255)))
 
         # ── 3. COMPOSE OUTPUT FRAME ──
-        # Use the last annotated frame (with landmarks/boxes) as the base,
-        # falling back to the raw frame before the first wheel check fires
         output_frame = last_annotated_frame if last_annotated_frame is not None else frame.copy()
 
-        # Always stamp confirmed hand state on every frame
         state_y = 100
         for side, key in [("LEFT", "left"), ("RIGHT", "right")]:
             is_on = confirmed_hand_state[key]
@@ -158,13 +340,15 @@ def run_pipeline(video_path=None):
                         cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 6)
             state_y += 100
 
-        # Pending debounce indicator (remove once tuning is done)
         if pending_hand_state is not None:
-            pending_text = f"pending ({pending_count}/{DEBOUNCE_THRESHOLD}): L={'ON' if pending_hand_state['left'] else 'OFF'} R={'ON' if pending_hand_state['right'] else 'OFF'}"
+            pending_text = (
+                f"pending ({pending_count}/{DEBOUNCE_THRESHOLD}): "
+                f"L={'ON' if pending_hand_state['left'] else 'OFF'} "
+                f"R={'ON' if pending_hand_state['right'] else 'OFF'}"
+            )
             cv2.putText(output_frame, pending_text, (50, state_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 200, 255), 2)
 
-        # Stamp any active alert text at the bottom
         for i, (text, color) in enumerate(last_status_text):
             cv2.putText(output_frame, text, (50, frame_h - 60 - i * 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.8, color, 4)
@@ -172,15 +356,56 @@ def run_pipeline(video_path=None):
         if out:
             out.write(output_frame)
 
-        # Still show preview while processing (remove if you want headless)
         cv2.imshow("Driver Monitor", output_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+    total_duration_seconds = frame_count / fps
+
     cap.release()
     if out:
         out.release()
-        print(f"✅ Done. Annotated video saved to: {output_path}")
+        print(f"✅ Silent annotated video saved to: {silent_output_path}")
+
     cv2.destroyAllWindows()
+
+    # ── 4. WAIT FOR IN-FLIGHT ALERT THREADS (up to 15 s) ──
+    if video_path:
+        print("⏳ Waiting for alert audio threads to finish...")
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            with alert_lock:
+                still_active = alert_active
+            if not still_active:
+                break
+            time.sleep(0.2)
+
+    # ── 5. MIX ALL AUDIO IN MEMORY, THEN MUX INTO FINAL VIDEO ──
+    if video_path and silent_output_path:
+        final_output_path = video_path.rsplit(".", 1)[0] + "_final.mp4"
+
+        with alert_log_lock:
+            captured_alerts = list(alert_log)
+
+        if captured_alerts:
+            print(f"🎚️  Mixing {len(captured_alerts)} alert(s) entirely in memory...")
+            pcm_bytes = build_audio_track(captured_alerts, total_duration_seconds)
+
+            if pcm_bytes:
+                mux_audio_into_video(
+                    silent_output_path, final_output_path,
+                    pcm_bytes, total_duration_seconds
+                )
+            else:
+                print("⚠️  Audio mixing produced no output — saving silent video.")
+                os.rename(silent_output_path, final_output_path)
+        else:
+            print("ℹ️  No alerts fired — saving video without audio.")
+            os.rename(silent_output_path, final_output_path)
+
+        # Clean up intermediate silent file
+        if os.path.exists(final_output_path) and os.path.exists(silent_output_path):
+            os.remove(silent_output_path)
+
 
 run_pipeline("test_data/test_video.mp4")
