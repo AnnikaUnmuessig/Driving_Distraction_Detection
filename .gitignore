@@ -3,3 +3,4 @@ DMD_dataset/*
 DMD/*
 DMD_clips/*
 .env
+test_data/full_videos/*

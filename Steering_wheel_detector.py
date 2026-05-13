@@ -10,6 +10,7 @@ from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.vision import drawing_utils
 from mediapipe.tasks.python.vision import drawing_styles
 import time
+import tempfile
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -41,10 +42,10 @@ def draw_landmarks_on_image(rgb_image, hand_results):
     annotated_image = cv2.cvtColor(np.copy(rgb_image), cv2.COLOR_RGB2BGR)
     if not hand_results.hand_landmarks:
         return annotated_image
-    
+
     hand_landmark_style = drawing_styles.get_default_hand_landmarks_style()
     hand_connection_style = drawing_styles.get_default_hand_connections_style()
-    
+
     for hand_landmarks in hand_results.hand_landmarks:
         drawing_utils.draw_landmarks(
             image=annotated_image,
@@ -59,30 +60,64 @@ def draw_pose_markers(bgr_image, pose_results, img_w, img_h):
     if not pose_results.pose_landmarks:
         return bgr_image
 
-    # Use the first person detected
     lms = pose_results.pose_landmarks[0]
-    
+
     # Indices: 15=L_Wrist, 16=R_Wrist, 13=L_Elbow, 14=R_Elbow
     keypoints = {"L Wrist": lms[15], "R Wrist": lms[16], "L Elbow": lms[13], "R Elbow": lms[14]}
 
     for name, lm in keypoints.items():
         if lm.visibility < 0.4: continue
         px, py = int(lm.x * img_w), int(lm.y * img_h)
-        # Orange for Left, Blue for Right
         color = (255, 128, 0) if "L" in name else (0, 128, 255)
         shape = cv2.MARKER_CROSS if "Elbow" in name else cv2.MARKER_STAR
         cv2.drawMarker(bgr_image, (px, py), color, markerType=shape, markerSize=25, thickness=2)
         cv2.putText(bgr_image, name, (px + 5, py - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
     return bgr_image
 
-def detect_steering_and_hands(image_path):
-    # Load and preprocess image
-    mp_image = mp.Image.create_from_file(image_path)
-    rgb_frame = mp_image.numpy_view()
+
+def detect_steering_and_hands(frame_or_path):
+    """
+    Accepts either:
+      - a numpy array (BGR) from cv2 — the normal pipeline path, zero disk I/O for MediaPipe
+      - a file path string         — legacy / one-off call support
+
+    Roboflow's SDK requires a file path, so when a numpy array is supplied a single
+    temp JPEG is written, used, and immediately deleted.  MediaPipe uses an in-memory
+    mp.Image constructed directly from the numpy array — no temp file needed there.
+    """
+    # ── Normalise input ───────────────────────────────────────────────────────
+    if isinstance(frame_or_path, str):
+        bgr_frame = cv2.imread(frame_or_path)
+        roboflow_source = frame_or_path   # already a path — skip temp file
+        _delete_temp = False
+    else:
+        bgr_frame = frame_or_path         # numpy BGR array from cap.read()
+        roboflow_source = None
+        _delete_temp = False              # set True below if we create a temp file
+
+    rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
     img_h, img_w = rgb_frame.shape[:2]
 
-    # 1. Detect Steering Wheel (YOLO/Roboflow)
-    output = model.predict(image_path, confidence=40).json()
+    # ── MediaPipe image (pure in-memory — no disk I/O) ────────────────────────
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+
+    # ── Roboflow (needs a file path) ──────────────────────────────────────────
+    if roboflow_source is None:
+        _, encoded = cv2.imencode(".jpg", bgr_frame)
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        tmp.write(encoded.tobytes())
+        tmp.flush()
+        tmp.close()
+        roboflow_source = tmp.name
+        _delete_temp = True
+
+    try:
+        output = model.predict(roboflow_source, confidence=40).json()
+    finally:
+        if _delete_temp:
+            os.unlink(roboflow_source)
+
+    # ── Steering box ──────────────────────────────────────────────────────────
     steering_box = None
     x1 = y1 = x2 = y2 = 0
     if output['predictions']:
@@ -92,7 +127,7 @@ def detect_steering_and_hands(image_path):
                           int(x_center + w/2), int(y_center + h/2))
         steering_box = (x1, y1, x2, y2)
 
-    # 2. Detect Hands and Pose (MediaPipe)
+    # ── MediaPipe detection ───────────────────────────────────────────────────
     hand_result = hand_detector.detect(mp_image)
     pose_result = pose_detector.detect(mp_image)
     print(f"Hand result: {hand_result}")
@@ -100,7 +135,6 @@ def detect_steering_and_hands(image_path):
     left_on = False
     right_on = False
 
-    # Pre-process detections for logic checks
     if hand_result.hand_landmarks:
         for idx, hand_lms in enumerate(hand_result.hand_landmarks):
             score = hand_result.handedness[idx][0].score
@@ -124,7 +158,7 @@ def detect_steering_and_hands(image_path):
                 "is_inside": is_inside
             })
 
-    # 3. Custom Logic: Evaluate Left/Right Status
+    # ── Custom Logic: Evaluate Left/Right Status ──────────────────────────────
     if len(detected_hands) == 2:
         labels = [h["raw_label"] for h in detected_hands]
         scores = [h["score"] for h in detected_hands]
@@ -148,15 +182,12 @@ def detect_steering_and_hands(image_path):
             right_on = hand["is_inside"]
             left_on = False
 
-    # Final assignment based on processed labels
     for hand in detected_hands:
         if hand.get("is_inside") and "label" in hand:
             if hand["label"] == "Left": left_on = True
             elif hand["label"] == "Right": right_on = True
 
-    # 4. FALLBACK: Use pose wrist landmarks for any undetected hand
-    #    This handles occlusion cases where a hand is hidden behind the steering wheel.
-    #    Pose landmarks indices: 15=L_Wrist, 16=R_Wrist
+    # ── Fallback: pose wrist landmarks for occluded hands ─────────────────────
     POSE_WRIST_INDICES = {"Left": 15, "Right": 16}
     POSE_VISIBILITY_THRESHOLD = 0.4
 
@@ -165,19 +196,12 @@ def detect_steering_and_hands(image_path):
 
         for side, current_status in [("Left", left_on), ("Right", right_on)]:
             if current_status:
-                # Hand was already confirmed ON by MediaPipe — no fallback needed
                 continue
 
-            # Check if this side was detected at all by MediaPipe
-            side_detected = any(
-                h.get("label") == side for h in detected_hands
-            )
-
+            side_detected = any(h.get("label") == side for h in detected_hands)
             if side_detected:
-                # MediaPipe found this hand but ruled it OFF — respect that
                 continue
 
-            # Hand not detected at all (likely occluded): fall back to pose wrist
             wrist_lm = lms[POSE_WRIST_INDICES[side]]
             if wrist_lm.visibility < POSE_VISIBILITY_THRESHOLD:
                 print(f"[Fallback] {side} wrist pose landmark not visible enough, skipping.")

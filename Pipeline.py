@@ -178,7 +178,7 @@ def run_pipeline(video_path=None):
     frames_buffer = []
     frame_count = 0
     last_action_frame = -ACTION_OVERLAP
-    last_annotated_frame = None
+    last_detection_result = None
     last_status_text = []
 
     # Debounce state
@@ -237,21 +237,24 @@ def run_pipeline(video_path=None):
         frame_count += 1
 
         # ── 1. STEERING WHEEL + HAND DETECTION ──
+        # ── 1. STEERING WHEEL + HAND DETECTION ──
         if current_time - last_wheel_check_time >= WHEEL_DETECTION_INTERVAL:
             last_wheel_check_time = current_time
 
-            temp_path = "_temp_frame.jpg"
-            cv2.imwrite(temp_path, frame)
-            result = detect_steering_and_hands(temp_path)
-            mp_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            last_annotated_frame = draw_landmarks_on_image(mp_frame, result["hand_result"])
-            last_annotated_frame = draw_pose_markers(last_annotated_frame, result["pose_result"], frame_w, frame_h)
+            # Current detection call
+            result = detect_steering_and_hands(frame)
+ 
+            # If current detection returned no box, but we have a previous result,
+            # pull the steering_box from that last_detection_result.
+            if result["steering_box"] is None and last_detection_result is not None:
+                if last_detection_result.get("steering_box") is not None:
+                    result["steering_box"] = last_detection_result["steering_box"]
+                    print("   ⚠️  Steering wheel not detected — using last known box as fallback.")
+                    # Optionally, you could print a log here to know it's falling back
+                    # print("Using cached steering wheel box")
 
-            if result["steering_box"]:
-                x1, y1, x2, y2 = result["steering_box"]
-                cv2.rectangle(last_annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 8)
-                cv2.putText(last_annotated_frame, "Steering Wheel", (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+            # Now, update the cache with this 'result' (which now contains the old box if needed)
+            last_detection_result = result              
 
             new_state = {
                 "left": result["left_hand_on"],
@@ -317,7 +320,18 @@ def run_pipeline(video_path=None):
                 last_status_text.append((f"⚠ {action.upper()}", (0, 165, 255)))
 
         # ── 3. COMPOSE OUTPUT FRAME ──
-        output_frame = last_annotated_frame if last_annotated_frame is not None else frame.copy()
+        # Re-draw landmarks on the current fresh frame every iteration to avoid stale overlays
+        if last_detection_result is not None:
+            mp_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            output_frame = draw_landmarks_on_image(mp_frame, last_detection_result["hand_result"])
+            output_frame = draw_pose_markers(output_frame, last_detection_result["pose_result"], frame_w, frame_h)
+            if last_detection_result["steering_box"]:
+                x1, y1, x2, y2 = last_detection_result["steering_box"]
+                cv2.rectangle(output_frame, (x1, y1), (x2, y2), (0, 255, 0), 8)
+                cv2.putText(output_frame, "Steering Wheel", (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+        else:
+            output_frame = frame.copy()
 
         state_y = 100
         for side, key in [("LEFT", "left"), ("RIGHT", "right")]:
@@ -396,4 +410,4 @@ def run_pipeline(video_path=None):
             os.remove(silent_output_path)
 
 
-run_pipeline("test_data/test_video.mp4")
+run_pipeline("test_data/full_videos/gB_10_s2_2019-03-11T15;15;21+01;00_rgb_body.mp4")
