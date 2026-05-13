@@ -32,6 +32,11 @@ def build_audio_track(alert_log, total_duration_seconds):
     """
     if not alert_log:
         return None
+    # ── DEBUG: print all alert timestamps ──
+    print(f"\n🔍 DEBUG — {len(alert_log)} alert(s) queued for mixing:")
+    for i, (ts, audio_bytes) in enumerate(alert_log):
+        print(f"   Alert {i+1}: timestamp={ts:.3f}s, size={len(audio_bytes):,} bytes")
+
 
     # One anonymous OS pipe per clip — FFmpeg reads the read-end, parent writes the write-end
     pipe_pairs = []
@@ -186,18 +191,6 @@ def run_pipeline(video_path=None):
     alert_active = False
 
     def fire_alert(distraction_output, video_timestamp):
-        """
-        Background thread: calls generate_safety_alert_all_groq and stores
-        the returned audio bytes in alert_log.
-
-        ── Required change in Feedback.py ─────────────────────────────────
-        generate_safety_alert_all_groq must RETURN the TTS audio as bytes:
-
-            audio_bytes = groq_client.audio.speech.create(...).content
-            # optionally still play it here
-            return audio_bytes   # <-- this is the only required addition
-        ────────────────────────────────────────────────────────────────────
-        """
         nonlocal alert_active
         try:
             audio_bytes = generate_safety_alert_all_groq(distraction_output)
@@ -207,7 +200,7 @@ def run_pipeline(video_path=None):
                     alert_log.append((video_timestamp, audio_bytes))
                 print(f"🔊 Alert audio captured ({len(audio_bytes):,} bytes) @ {video_timestamp:.2f}s")
             else:
-                print("⚠️  generate_safety_alert_all_groq returned no bytes — add 'return audio_bytes' in Feedback.py")
+                print("⚠️  generate_safety_alert_all_groq returned no bytes")
 
         except Exception as e:
             print(f"❌ Alert failed: {e}")
@@ -216,14 +209,16 @@ def run_pipeline(video_path=None):
                 alert_active = False
 
     def trigger_alert(distraction_output):
-        """Thread-safe alert trigger. Drops the alert if one is already in flight."""
         nonlocal alert_active
+
         with alert_lock:
             if alert_active:
+                print(f"   ❌ Blocked — alert already active")
                 return False
             alert_active = True
+            video_timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-        video_timestamp = frame_count / fps
+        print(f"🚨 Alert fired at video_time={video_timestamp:.3f}s")
 
         threading.Thread(
             target=fire_alert,
@@ -231,7 +226,6 @@ def run_pipeline(video_path=None):
             daemon=True
         ).start()
         return True
-
     print("Pipeline running. Press 'q' to quit.")
 
     while cap.isOpened():
@@ -292,19 +286,13 @@ def run_pipeline(video_path=None):
                 print(f"Hands off wheel for {hands_off_duration:.1f}s")
 
                 if hands_off_duration >= HANDS_OFF_THRESHOLD:
-                    # Try to trigger the alert
                     alert_was_fired = trigger_alert({
                         "distracted": "yes",
                         "distraction_type": "hands off wheel",
                         "type of warning": "mid-heavy"
                     })
+                    hands_off_since = current_time
 
-                    # CRITICAL FIX: Whether the alert fired or was blocked by 'alert_active',
-                    # we MUST reset the hands_off_since timer. 
-                    # This forces the driver to wait another full HANDS_OFF_THRESHOLD 
-                    # before the system even considers alerting again.
-                    hands_off_since = current_time 
-                    
                     if alert_was_fired:
                         print("📢 Alert started - Blocking new triggers until voice finishes.")
 
