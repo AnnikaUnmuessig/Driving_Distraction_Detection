@@ -1,0 +1,51 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --color-background-primary: #09090d;
+  --color-background-secondary: rgba(255,255,255,0.04);
+  --color-background-tertiary: #09090d;
+  --color-text-primary: rgba(255,255,255,0.85);
+  --color-text-secondary: rgba(255,255,255,0.45);
+  --color-text-tertiary: rgba(255,255,255,0.2);
+  --color-border-tertiary: rgba(255,255,255,0.08);
+  --color-border-secondary: rgba(255,255,255,0.15);
+  --font-sans: 'JetBrains Mono', 'Fira Code', monospace;
+  --border-radius-md: 4px;
+  --border-radius-lg: 8px;
+}
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-background-primary);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+button, select {
+  font-family: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(255,255,255,0.04);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.15);
+  border-radius: 2px;
+}
