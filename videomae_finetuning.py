@@ -27,8 +27,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from PIL import Image
 from collections import Counter, defaultdict
-from sklearn.metrics import f1_score, confusion_matrix
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import torch.nn.functional as F
 from transformers import (
     VideoMAEImageProcessor,
     VideoMAEForVideoClassification,
@@ -66,6 +67,30 @@ class CustomLoggingCallback(TrainerCallback):
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         pass   # Trainer's tqdm already shows per-step info
+
+
+class CheckpointCleanupCallback(TrainerCallback):
+    """Delete stale checkpoints immediately after each save.
+
+    HF Trainer's save_total_limit only prunes checkpoints at the *next* save
+    event, so on Kaggle (20 GB disk) you can temporarily have N+1 checkpoints
+    on disk.  This callback removes every checkpoint folder except the most
+    recently written one right after the Trainer finishes saving, keeping disk
+    usage at roughly 1 × checkpoint size at all times.
+    """
+
+    def on_save(self, args, state, control, **kwargs):
+        import glob, shutil
+        output_dir = args.output_dir
+        # Trainer names checkpoints as checkpoint-<step>
+        ckpt_dirs = sorted(
+            glob.glob(os.path.join(output_dir, "checkpoint-*")),
+            key=lambda p: int(p.rsplit("-", 1)[-1]),
+        )
+        # Keep only the last one (the one just saved)
+        for old_ckpt in ckpt_dirs[:-1]:
+            shutil.rmtree(old_ckpt, ignore_errors=True)
+            print(f"  🗑  Removed stale checkpoint: {os.path.basename(old_ckpt)}")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -215,8 +240,49 @@ def compute_metrics(eval_pred):
 
 # ── Balanced Trainer ───────────────────────────────────────────────────────────
 
+def compute_class_weights(train_entries, num_classes, device):
+    """Compute inverse-frequency class weights and move them to device.
+
+    These weights are passed to F.cross_entropy so that rarer classes
+    (including safe_driving when it is under-represented) contribute
+    more to the loss, preventing the model from ignoring them.
+    """
+    label_counts = Counter(label for _, label in train_entries)
+    # Use the total number of training samples divided by (num_classes * count)
+    # — same formula as sklearn's compute_class_weight('balanced')
+    total = sum(label_counts.values())
+    weights = torch.zeros(num_classes, dtype=torch.float)
+    for cls_id in range(num_classes):
+        count = label_counts.get(cls_id, 1)   # avoid division by zero
+        weights[cls_id] = total / (num_classes * count)
+    print("Class weights for cross-entropy loss:")
+    for cls_id, w in enumerate(weights):
+        print(f"  [{cls_id:2d}] {ID2LABEL[cls_id]:25s}: {w:.4f}")
+    return weights.to(device)
+
+
 class BalancedTrainer(Trainer):
-    """Uses WeightedRandomSampler to give rare classes equal expected frequency."""
+    """WeightedRandomSampler + class-weighted cross-entropy loss.
+
+    The sampler ensures every class appears at roughly equal frequency
+    within each batch.  The weighted loss provides an additional signal
+    to the gradient so the model genuinely learns rare / hard classes
+    (e.g. safe_driving) instead of collapsing them.
+    """
+
+    def __init__(self, *args, class_weights=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._class_weights = class_weights   # Tensor on the correct device
+
+    # ── Weighted loss ──────────────────────────────────────────────────────────
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels  = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits  = outputs.logits
+        loss = F.cross_entropy(logits, labels, weight=self._class_weights)
+        return (loss, outputs) if return_outputs else loss
+
+    # ── Balanced sampler ───────────────────────────────────────────────────────
     def get_train_dataloader(self):
         labels        = [item[1] for item in self.train_dataset.entries]
         class_counts  = Counter(labels)
@@ -312,7 +378,8 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model="accuracy",
         greater_is_better=True,
-        save_total_limit=3,
+        # Keep only the single best checkpoint on disk — critical on Kaggle (20 GB limit)
+        save_total_limit=1,
 
         dataloader_num_workers=2,
         disable_tqdm=False,
@@ -328,6 +395,10 @@ def main():
         seed=SEED,
     )
 
+    # ── Class weights (for weighted cross-entropy) ────────────────────────────
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    class_weights = compute_class_weights(train_entries, NUM_CLASSES, device)
+
     # ── Trainer ───────────────────────────────────────────────────────────────
     trainer = BalancedTrainer(
         model=model,
@@ -336,9 +407,11 @@ def main():
         eval_dataset=val_dataset,
         data_collator=default_data_collator,
         compute_metrics=compute_metrics,
+        class_weights=class_weights,
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=5),
             CustomLoggingCallback(),
+            CheckpointCleanupCallback(),
         ],
     )
 
@@ -358,11 +431,24 @@ def main():
     for k, v in test_results.metrics.items():
         print(f"  {k}: {v}")
 
-    # Confusion matrix
+    # Per-class report (precision / recall / f1 per ogni classe)
     preds  = np.argmax(test_results.predictions, axis=1)
     labels = test_results.label_ids
-    cm     = confusion_matrix(labels, preds)
+    print("\nPer-class classification report:")
+    print(classification_report(
+        labels, preds,
+        target_names=[ID2LABEL[i] for i in range(NUM_CLASSES)],
+        zero_division=0,
+    ))
 
+    # ── Save best model ───────────────────────────────────────────────────────
+    best_model_dir = os.path.join(OUTPUT_DIR, "best_model")
+    trainer.save_model(best_model_dir)
+    processor.save_pretrained(best_model_dir)
+    print(f"\nBest model saved to: {best_model_dir}")
+
+    # ── Confusion matrix (saved inside best_model/) ───────────────────────────
+    cm = confusion_matrix(labels, preds)
     plt.figure(figsize=(12, 10))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
                 xticklabels=[ID2LABEL[i] for i in range(NUM_CLASSES)],
@@ -371,22 +457,38 @@ def main():
     plt.xlabel("Predicted Label")
     plt.title("Confusion Matrix — VideoMAE Test Set")
     plt.tight_layout()
-    cm_path = os.path.join(OUTPUT_DIR, "confusion_matrix.png")
-    plt.savefig(cm_path)
+    cm_path = os.path.join(best_model_dir, "confusion_matrix.png")
+    plt.savefig(cm_path, dpi=150)
     plt.close()
     print(f"Confusion matrix saved to {cm_path}")
 
-    # Training history
-    log_path = os.path.join(OUTPUT_DIR, "training_metrics.json")
-    with open(log_path, "w") as f:
-        json.dump(trainer.state.log_history, f, indent=4)
-    print(f"Training metrics saved to {log_path}")
+    # ── Training curves JSON (for plotting) ───────────────────────────────────
+    # Extract one entry per epoch with train_loss, val_loss, train_acc, val_acc.
+    # The HF Trainer writes training and eval metrics as *separate* entries in
+    # log_history; we merge them by epoch number.
+    epoch_data: dict[int, dict] = {}
+    for entry in trainer.state.log_history:
+        ep = int(entry.get("epoch", -1))
+        if ep < 0:
+            continue
+        row = epoch_data.setdefault(ep, {"epoch": ep})
+        if "loss" in entry:           row["train_loss"] = round(entry["loss"], 6)
+        if "eval_loss" in entry:      row["val_loss"]   = round(entry["eval_loss"], 6)
+        if "eval_accuracy" in entry:  row["val_acc"]    = round(entry["eval_accuracy"], 6)
+        # train accuracy is not logged by default; include it when available
+        if "train_accuracy" in entry: row["train_acc"]  = round(entry["train_accuracy"], 6)
 
-    # ── Save best model locally ───────────────────────────────────────────────
-    best_model_dir = os.path.join(OUTPUT_DIR, "best_model")
-    trainer.save_model(best_model_dir)
-    processor.save_pretrained(best_model_dir)
-    print(f"\nBest model saved to: {best_model_dir}")
+    training_curves = sorted(epoch_data.values(), key=lambda r: r["epoch"])
+    curves_path = os.path.join(best_model_dir, "training_curves.json")
+    with open(curves_path, "w") as f:
+        json.dump(training_curves, f, indent=4)
+    print(f"Training curves saved to {curves_path}")
+
+    # Full raw log (for debugging)
+    raw_log_path = os.path.join(best_model_dir, "training_log_raw.json")
+    with open(raw_log_path, "w") as f:
+        json.dump(trainer.state.log_history, f, indent=4)
+    print(f"Raw training log saved to {raw_log_path}")
 
     if HF_REPO_ID:
         print(f"Checkpoints also pushed to HF Hub: https://huggingface.co/{HF_REPO_ID}")
