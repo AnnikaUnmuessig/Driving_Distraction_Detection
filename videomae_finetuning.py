@@ -112,17 +112,16 @@ PER_DEVICE_EVAL_BATCH  = int(os.environ.get("EVAL_BATCH_SIZE",  "2"))
 GRAD_ACCUM_STEPS       = int(os.environ.get("GRAD_ACCUM_STEPS", "8"))
 
 CLASS_MAP = {
-    "safe_driving":         0,
-    "texting_right":        1,
-    "phonecall_right":      2,
-    "texting_left":         3,
-    "phonecall_left":       4,
-    "radio":                5,
-    "drinking":             6,
-    "reach_side":           7,
-    "hair_and_makeup":      8,
-    "talking_to_passenger": 9,
-    "change_gear":         10,
+    "safe_driving":    0,
+    "texting_right":   1,
+    "phonecall_right": 2,
+    "texting_left":    3,
+    "phonecall_left":  4,
+    "radio":           5,
+    "drinking":        6,
+    "reach_side":      7,
+    "hair_and_makeup": 8,
+    "change_gear":     9,
 }
 ID2LABEL    = {v: k for k, v in CLASS_MAP.items()}
 NUM_CLASSES = len(CLASS_MAP)
