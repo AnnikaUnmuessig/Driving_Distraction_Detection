@@ -4,8 +4,10 @@ import time
 import threading
 import os
 import subprocess
+import queue
 from Steering_wheel_detector import detect_steering_and_hands, draw_landmarks_on_image, draw_pose_markers
 from Feedback import generate_safety_alert_all_groq
+from action_recognition import ActionRecognizer
 
 # Fixed variables
 HANDS_OFF_THRESHOLD = 1        # seconds temporarily low
@@ -13,11 +15,81 @@ WHEEL_DETECTION_INTERVAL = 1   # seconds
 TIMESFORMER_WINDOW_SIZE = 16   # number of frames for action classification
 ACTION_OVERLAP = 8             # start new action classification every 8 frames
 DEBOUNCE_THRESHOLD = 3         # number of consecutive detections to confirm state change
+ACTION_CONFIDENCE_THRESHOLD = 0.5  # confidence threshold for action alerts
 
-# Dummy action classifier
-def classify_action(frames_buffer):
-    # placeholder
-    return None
+
+class ActionRecognitionWorker:
+    """Background thread worker for action recognition inference"""
+    
+    def __init__(self):
+        self.queue = queue.Queue(maxsize=5)  # buffer up to 5 frame sets
+        self.latest_result = None
+        self.result_lock = threading.Lock()
+        self.running = False
+        self.recognizer = None
+        self.worker_thread = None
+        
+    def start(self):
+        """Initialize model and start worker thread"""
+        try:
+            self.recognizer = ActionRecognizer()
+            self.running = True
+            self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self.worker_thread.start()
+            print("✅ Action recognition worker started")
+        except Exception as e:
+            print(f"❌ Failed to start action recognizer: {e}")
+            self.running = False
+    
+    def _worker_loop(self):
+        """Continuous loop consuming frame buffers"""
+        while self.running:
+            try:
+                frames_buffer = self.queue.get(timeout=1)
+                if frames_buffer is None:  # shutdown signal
+                    break
+                    
+                result = self.recognizer.predict(frames_buffer, top_k=3)
+                with self.result_lock:
+                    self.latest_result = result
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"❌ Action recognition error: {e}")
+    
+    def queue_frames(self, frames: list):
+        """Non-blocking push of frame buffer to queue"""
+        try:
+            self.queue.put_nowait(frames)
+        except queue.Full:
+            pass  # silently skip if queue full
+    
+    def get_result(self):
+        """Retrieve latest action result (non-blocking)"""
+        with self.result_lock:
+            return self.latest_result
+    
+    def stop(self):
+        """Gracefully shutdown"""
+        self.running = False
+        try:
+            self.queue.put(None, block=False)
+        except queue.Full:
+            pass
+
+
+def classify_action(frames_buffer, action_worker=None):
+    """
+    Wrapper for action classification.
+    If action_worker is provided, queues frames and returns previous result.
+    Otherwise returns None (backward compatible).
+    """
+    if action_worker is None:
+        return None
+    
+    action_worker.queue_frames(frames_buffer.copy())
+    return action_worker.get_result()
 
 
 def build_audio_track(alert_log, total_duration_seconds):

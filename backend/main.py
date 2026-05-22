@@ -30,11 +30,13 @@ from pipeline import (
     build_audio_track,
     classify_action,
     mux_audio_into_video,
+    ActionRecognitionWorker,
     ACTION_OVERLAP,
     DEBOUNCE_THRESHOLD,
     HANDS_OFF_THRESHOLD,
     TIMESFORMER_WINDOW_SIZE,
     WHEEL_DETECTION_INTERVAL,
+    ACTION_CONFIDENCE_THRESHOLD,
 )
 
 UPLOAD_DIR = Path("uploads")
@@ -94,6 +96,11 @@ class DetectionState:
         self.alert_lock = threading.Lock()
         self.alert_log: list = []
         self.alert_log_lock = threading.Lock()
+        self.latest_action_result: Optional[dict] = None
+        
+        # Action recognition worker
+        self.action_worker = ActionRecognitionWorker()
+        self.action_worker.start()
 
     def process_frame(self, frame: np.ndarray, current_time: float, cap_msec: float):
         h, w = frame.shape[:2]
@@ -162,13 +169,22 @@ class DetectionState:
             and self.frame_count - self.last_action_frame >= ACTION_OVERLAP
         ):
             self.last_action_frame = self.frame_count
-            action = classify_action(self.frames_buffer)
-            if action:
-                self._trigger_alert(
-                    {"distracted": "yes", "distraction_type": action, "type of warning": "light-mid"},
-                    cap_msec / 1000.0,
-                )
-                events.append({"type": "alert", "distraction_type": action, "severity": "light-mid"})
+            
+            # Queue frames for async processing
+            self.action_worker.queue_frames(self.frames_buffer.copy())
+            
+            # Check for result from previous batch
+            result = self.action_worker.get_result()
+            if result:
+                self.latest_action_result = result  # Store for display
+                if result.get("confidence", 0) > ACTION_CONFIDENCE_THRESHOLD:
+                    action = result["predicted_class"]
+                    fired = self._trigger_alert(
+                        {"distracted": "yes", "distraction_type": action, "type of warning": "light-mid"},
+                        cap_msec / 1000.0,
+                    )
+                    if fired:
+                        events.append({"type": "alert", "distraction_type": action, "severity": "light-mid"})
 
         self.frame_count += 1
         output_frame = self._annotate(frame, w, h)
@@ -211,6 +227,21 @@ class DetectionState:
             cv2.putText(out, f"{side}: {'ON' if is_on else 'OFF'}", (50, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 255, 0) if is_on else (0, 0, 255), 6)
             y += 100
+        
+        # Display action recognition result
+        if self.latest_action_result:
+            action_text = f"Action: {self.latest_action_result['predicted_class']}"
+            confidence_text = f"Confidence: {self.latest_action_result['confidence']:.2%}"
+            
+            # Determine color based on confidence threshold
+            conf_value = self.latest_action_result['confidence']
+            color = (0, 165, 255) if conf_value > ACTION_CONFIDENCE_THRESHOLD else (100, 100, 255)  # orange if alert threshold, light red otherwise
+            
+            cv2.putText(out, action_text, (50, h - 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+            cv2.putText(out, confidence_text, (50, h - 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+        
         return out
 
 
