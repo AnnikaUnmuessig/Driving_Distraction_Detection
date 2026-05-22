@@ -4,3 +4,4 @@ DMD/*
 DMD_clips/*
 .env
 test_data/full_videos/*
+models/video_mae/*
