@@ -69,28 +69,7 @@ class CustomLoggingCallback(TrainerCallback):
         pass   # Trainer's tqdm already shows per-step info
 
 
-class CheckpointCleanupCallback(TrainerCallback):
-    """Delete stale checkpoints immediately after each save.
 
-    HF Trainer's save_total_limit only prunes checkpoints at the *next* save
-    event, so on Kaggle (20 GB disk) you can temporarily have N+1 checkpoints
-    on disk.  This callback removes every checkpoint folder except the most
-    recently written one right after the Trainer finishes saving, keeping disk
-    usage at roughly 1 × checkpoint size at all times.
-    """
-
-    def on_save(self, args, state, control, **kwargs):
-        import glob, shutil
-        output_dir = args.output_dir
-        # Trainer names checkpoints as checkpoint-<step>
-        ckpt_dirs = sorted(
-            glob.glob(os.path.join(output_dir, "checkpoint-*")),
-            key=lambda p: int(p.rsplit("-", 1)[-1]),
-        )
-        # Keep only the last one (the one just saved)
-        for old_ckpt in ckpt_dirs[:-1]:
-            shutil.rmtree(old_ckpt, ignore_errors=True)
-            print(f"  [CLEAN] Removed stale checkpoint: {os.path.basename(old_ckpt)}")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -399,8 +378,8 @@ def main():
         fp16=True,
 
         # Optimizer & scheduler
-        learning_rate=5e-5,         # slightly higher than TimeSformer (MAE features are robust)
-        num_train_epochs=5,        # reduced epochs for quick testing
+        learning_rate=5e-5,         
+        num_train_epochs=15,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         weight_decay=0.05,
@@ -444,7 +423,6 @@ def main():
         class_weights=class_weights,
         callbacks=[
             CustomLoggingCallback(),
-            CheckpointCleanupCallback(),
         ],
     )
 
