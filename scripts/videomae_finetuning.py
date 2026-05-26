@@ -309,8 +309,9 @@ class BalancedTrainer(Trainer):
 
     # ── Weighted loss ──────────────────────────────────────────────────────────
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels  = inputs.pop("labels")
-        outputs = model(**inputs)
+        labels  = inputs.get("labels")          # read without removing — Trainer needs labels for compute_metrics
+        model_inputs = {k: v for k, v in inputs.items() if k != "labels"}  # strip labels before forward pass
+        outputs = model(**model_inputs)
         logits  = outputs.logits
         loss = F.cross_entropy(logits, labels, weight=self._class_weights)
         return (loss, outputs) if return_outputs else loss
@@ -409,7 +410,7 @@ def main():
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
-        metric_for_best_model="eval_accuracy",
+        metric_for_best_model="accuracy",   # Trainer prepends 'eval_' automatically → looks for eval_accuracy
         greater_is_better=True,
         # Keep the two latest checkpoints to preserve the best one
         save_total_limit=4,
