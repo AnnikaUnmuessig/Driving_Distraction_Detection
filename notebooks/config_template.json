@@ -1,0 +1,6 @@
+{
+  "DRIVE_FOLDER_ID": "YOUR_DRIVE_FOLDER_ID_HERE",
+  "OUTPUT_CLIPS_DIR": "/content/drive/MyDrive/DMD_clips",
+  "REPO_DIR": "/content/Driving_Distraction_Detection",
+  "REPO_URL": "https://github.com/AnnikaUnmuessig/Driving_Distraction_Detection.git"
+}

@@ -5,3 +5,9 @@ DMD_clips/*
 .env
 test_data/full_videos/*
 models/video_mae/*
+data/*
+DMD_dataset/
+notebooks/config.json
+env
+.DS_Store
+*.DS_Store
