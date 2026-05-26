@@ -399,7 +399,7 @@ def main():
 
         # Optimizer & scheduler
         learning_rate=5e-5,         # slightly higher than TimeSformer (MAE features are robust)
-        num_train_epochs=15,        # more epochs — VideoMAE benefits from longer fine-tuning
+        num_train_epochs=5,        # reduced epochs for quick testing
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         weight_decay=0.05,
@@ -411,8 +411,8 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model="accuracy",
         greater_is_better=True,
-        # Keep only the single best checkpoint on disk — critical on Kaggle (20 GB limit)
-        save_total_limit=1,
+        # Keep the two latest checkpoints to preserve the best one
+        save_total_limit=4,
 
         dataloader_num_workers=2,
         disable_tqdm=False,
