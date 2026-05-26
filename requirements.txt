@@ -22,3 +22,8 @@ tqdm
 peft
 accelerate
 bitsandbytes
+roboflow
+mediapipe
+simpleaudio
+groq
+pydub

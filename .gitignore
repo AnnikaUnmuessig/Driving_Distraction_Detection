@@ -11,3 +11,9 @@ notebooks/config.json
 env
 .DS_Store
 *.DS_Store
+backend/outputs/*
+backend/uploads/*
+backend/__pycache__/*   
+frontend/node_modules/
+frontend/build/*
+frontend/__pycache__/*

@@ -80,7 +80,7 @@ def draw_pose_markers(bgr_image, pose_results, img_w, img_h):
     return bgr_image
 
 
-def detect_steering_and_hands(frame_or_path):
+def detect_steering_and_hands(frame_or_path, steering_box=None):
     """
     Accepts either:
       - a numpy array (BGR) from cv2 — the normal pipeline path, zero disk I/O for MediaPipe
@@ -106,31 +106,33 @@ def detect_steering_and_hands(frame_or_path):
     # ── MediaPipe image (pure in-memory — no disk I/O) ────────────────────────
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-    # ── Roboflow (needs a file path) ──────────────────────────────────────────
-    if roboflow_source is None:
-        _, encoded = cv2.imencode(".jpg", bgr_frame)
-        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        tmp.write(encoded.tobytes())
-        tmp.flush()
-        tmp.close()
-        roboflow_source = tmp.name
-        _delete_temp = True
-
-    try:
-        output = model.predict(roboflow_source, confidence=40).json()
-    finally:
-        if _delete_temp:
-            os.unlink(roboflow_source)
-
-    # ── Steering box ──────────────────────────────────────────────────────────
-    steering_box = None
     x1 = y1 = x2 = y2 = 0
-    if output['predictions']:
-        pred = output['predictions'][0]
-        x_center, y_center, w, h = pred['x'], pred['y'], pred['width'], pred['height']
-        x1, y1, x2, y2 = (int(x_center - w/2), int(y_center - h/2),
-                          int(x_center + w/2), int(y_center + h/2))
-        steering_box = (x1, y1, x2, y2)
+    # ── Roboflow (needs a file path) ──────────────────────────────────────────
+    if steering_box is None:
+        if roboflow_source is None:
+            _, encoded = cv2.imencode(".jpg", bgr_frame)
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            tmp.write(encoded.tobytes())
+            tmp.flush()
+            tmp.close()
+            roboflow_source = tmp.name
+            _delete_temp = True
+
+        try:
+            output = model.predict(roboflow_source, confidence=40).json()
+        finally:
+            if _delete_temp:
+                os.unlink(roboflow_source)
+
+        # ── Steering box ──────────────────────────────────────────────────────────
+        if output['predictions']:
+            pred = output['predictions'][0]
+            x_center, y_center, w, h = pred['x'], pred['y'], pred['width'], pred['height']
+            x1, y1, x2, y2 = (int(x_center - w/2), int(y_center - h/2),
+                              int(x_center + w/2), int(y_center + h/2))
+            steering_box = (x1, y1, x2, y2)
+    else:
+        x1, y1, x2, y2 = steering_box
 
     # ── MediaPipe detection ───────────────────────────────────────────────────
     hand_result = hand_detector.detect(mp_image)

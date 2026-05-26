@@ -9,6 +9,7 @@ Exposes:
 """
 
 import asyncio
+import json
 import os
 import queue
 import threading
@@ -30,13 +31,15 @@ from pipeline import (
     build_audio_track,
     classify_action,
     mux_audio_into_video,
+    _convert_to_h264,
     ActionRecognitionWorker,
     ACTION_OVERLAP,
     DEBOUNCE_THRESHOLD,
     HANDS_OFF_THRESHOLD,
-    TIMESFORMER_WINDOW_SIZE,
+    VIDEOMAE_WINDOW_SIZE,
     WHEEL_DETECTION_INTERVAL,
     ACTION_CONFIDENCE_THRESHOLD,
+    EMA_ALPHA,
 )
 
 UPLOAD_DIR = Path("uploads")
@@ -69,6 +72,7 @@ def _make_job() -> dict:
         "progress": 0,
         "alert_count": 0,
         "output_path": None,
+        "detection_state": None,
         "error": None,
         "frame_queue": queue.Queue(maxsize=120),   # ~4 s buffer at 30 fps
         "event_queue": queue.Queue(maxsize=200),
@@ -82,12 +86,18 @@ def _update_job(job_id: str, **kwargs):
 
 # ── shared detection state ─────────────────────────────────────────────────────
 class DetectionState:
-    def __init__(self):
+    def __init__(self, fps: float = 30.0, play_audio: bool = True):
+        self.fps = fps
+        self.play_audio = play_audio
         self.hands_off_since: Optional[float] = None
-        self.last_wheel_check_time: float = 0
+        self.last_roboflow_time: float = 0
+        self.cached_steering_box: Optional[tuple] = None
         self.frames_buffer: list = []
         self.frame_count: int = 0
-        self.last_action_frame: int = -ACTION_OVERLAP
+        self.last_action_time_sec: float = 0.0
+        self.action_interval_sec: float = 1.0
+        self.last_processed_result_id: int = -1
+        self.last_alert_time: float = 0.0
         self.last_detection_result: Optional[dict] = None
         self.confirmed_hand_state: dict = {"left": True, "right": True}
         self.pending_hand_state: Optional[dict] = None
@@ -97,7 +107,15 @@ class DetectionState:
         self.alert_log: list = []
         self.alert_log_lock = threading.Lock()
         self.latest_action_result: Optional[dict] = None
-        
+
+        # Toggle flags (controllable from frontend)
+        self.mediapipe_enabled: bool = True
+        self.videomae_enabled: bool = True
+        self.paused: bool = False
+
+        # EMA smoothing state
+        self.prev_probs: Optional[list] = None
+
         # Action recognition worker
         self.action_worker = ActionRecognitionWorker()
         self.action_worker.start()
@@ -106,13 +124,27 @@ class DetectionState:
         h, w = frame.shape[:2]
         events = []
 
-        if current_time - self.last_wheel_check_time >= WHEEL_DETECTION_INTERVAL:
-            self.last_wheel_check_time = current_time
-            result = detect_steering_and_hands(frame)
+        # Use video timeline time for file uploads and wall-clock time for live webcam
+        time_sec = cap_msec / 1000.0 if not self.play_audio else current_time
 
-            if result["steering_box"] is None and self.last_detection_result is not None:
-                if self.last_detection_result.get("steering_box") is not None:
+        # -- Mediapipe: steering wheel + hand detection --
+        if self.mediapipe_enabled:
+            run_roboflow = False
+            if time_sec - self.last_roboflow_time >= 30.0 or self.cached_steering_box is None:
+                run_roboflow = True
+                self.last_roboflow_time = time_sec
+
+            # Run MediaPipe on every frame, passing the cached box if Roboflow is skipped
+            result = detect_steering_and_hands(frame, steering_box=None if run_roboflow else self.cached_steering_box)
+
+            if run_roboflow:
+                if result["steering_box"] is not None:
+                    self.cached_steering_box = result["steering_box"]
+                elif self.last_detection_result is not None and self.last_detection_result.get("steering_box") is not None:
                     result["steering_box"] = self.last_detection_result["steering_box"]
+                    self.cached_steering_box = self.last_detection_result["steering_box"]
+            else:
+                result["steering_box"] = self.cached_steering_box
 
             self.last_detection_result = result
             new_state = {"left": result["left_hand_on"], "right": result["right_hand_on"]}
@@ -127,7 +159,6 @@ class DetectionState:
                     self.confirmed_hand_state = new_state
                     self.pending_hand_state = None
                     self.pending_count = 0
-                    # Send hand state update if it changed
                     if old_state != self.confirmed_hand_state:
                         events.append({
                             "type": "hand_state",
@@ -137,70 +168,93 @@ class DetectionState:
             else:
                 self.pending_hand_state = new_state
                 self.pending_count = 1
-                # Send pending state update
                 events.append({
                     "type": "hand_state",
                     "confirmed": self.confirmed_hand_state,
                     "pending_count": self.pending_count
                 })
 
-        hands_on = self.confirmed_hand_state["left"] and self.confirmed_hand_state["right"]
-        if hands_on:
-            self.hands_off_since = None
-        else:
-            if self.hands_off_since is None:
-                self.hands_off_since = current_time
-            off_duration = current_time - self.hands_off_since
-            if off_duration >= HANDS_OFF_THRESHOLD:
-                fired = self._trigger_alert(
-                    {"distracted": "yes", "distraction_type": "hands off wheel", "type of warning": "mid-heavy"},
-                    cap_msec / 1000.0,
-                )
-                if fired:
-                    self.hands_off_since = current_time
-                    events.append({"type": "alert", "distraction_type": "hands off wheel", "severity": "mid-heavy"})
-
-        self.frames_buffer.append(frame)
-        if len(self.frames_buffer) > TIMESFORMER_WINDOW_SIZE:
-            self.frames_buffer.pop(0)
-
-        if (
-            len(self.frames_buffer) == TIMESFORMER_WINDOW_SIZE
-            and self.frame_count - self.last_action_frame >= ACTION_OVERLAP
-        ):
-            self.last_action_frame = self.frame_count
-            
-            # Queue frames for async processing
-            self.action_worker.queue_frames(self.frames_buffer.copy())
-            
-            # Check for result from previous batch
-            result = self.action_worker.get_result()
-            if result:
-                self.latest_action_result = result  # Store for display
-                if result.get("confidence", 0) > ACTION_CONFIDENCE_THRESHOLD:
-                    action = result["predicted_class"]
+            hands_on = self.confirmed_hand_state["left"] and self.confirmed_hand_state["right"]
+            if hands_on:
+                self.hands_off_since = None
+            else:
+                if self.hands_off_since is None:
+                    self.hands_off_since = time_sec
+                off_duration = time_sec - self.hands_off_since
+                if off_duration >= HANDS_OFF_THRESHOLD:
                     fired = self._trigger_alert(
-                        {"distracted": "yes", "distraction_type": action, "type of warning": "light-mid"},
-                        cap_msec / 1000.0,
+                        {"distracted": "yes", "distraction_type": "hands off wheel", "type of warning": "mid-heavy"},
+                        time_sec,
                     )
                     if fired:
-                        events.append({"type": "alert", "distraction_type": action, "severity": "light-mid"})
+                        self.hands_off_since = time_sec
+                        events.append({"type": "alert", "distraction_type": "hands off wheel", "severity": "mid-heavy"})
+
+        # -- VideoMAE: action classification --
+        if self.videomae_enabled:
+            self.frames_buffer.append(frame)
+            max_buffer_size = max(16, int(round(self.fps * self.action_interval_sec)))
+            while len(self.frames_buffer) > max_buffer_size:
+                self.frames_buffer.pop(0)
+
+            # Queue frames at the configured action_interval_sec rate
+            if (
+                len(self.frames_buffer) >= 16
+                and time_sec - self.last_action_time_sec >= self.action_interval_sec
+            ):
+                self.last_action_time_sec = time_sec
+                # Sample 16 frames uniformly
+                n = len(self.frames_buffer)
+                indices = np.linspace(0, n - 1, 16, dtype=int)
+                sampled_frames = [self.frames_buffer[i] for i in indices]
+                self.action_worker.queue_frames(sampled_frames, prev_probs=self.prev_probs)
+
+            # Read latest prediction result (polled on every single frame)
+            result = self.action_worker.get_result()
+            if result:
+                result_id = result.get("result_id", 0)
+                if result_id > self.last_processed_result_id:
+                    self.last_processed_result_id = result_id
+                    
+                    # Track EMA probs
+                    if "probs" in result:
+                        self.prev_probs = result["probs"]
+                    self.latest_action_result = result
+                    
+                    if result.get("confidence", 0) > ACTION_CONFIDENCE_THRESHOLD:
+                        action = result["predicted_class"]
+                        fired = self._trigger_alert(
+                            {"distracted": "yes", "distraction_type": action, "type of warning": "light-mid"},
+                            time_sec,
+                        )
+                        if fired:
+                            events.append({"type": "alert", "distraction_type": action, "severity": "light-mid"})
 
         self.frame_count += 1
         output_frame = self._annotate(frame, w, h)
         return {"frame": output_frame, "events": events}
 
-    def _trigger_alert(self, distraction_output, video_timestamp):
+    def _trigger_alert(self, distraction_output, timestamp_sec):
+        # Cooldown of 3.5 seconds in video timeline time (or wall-clock time for webcam)
+        if timestamp_sec - self.last_alert_time < 3.5:
+            return False
+
         with self.alert_lock:
             if self.alert_active:
                 return False
             self.alert_active = True
-        threading.Thread(target=self._fire_alert, args=(distraction_output, video_timestamp), daemon=True).start()
+            self.last_alert_time = timestamp_sec
+
+        threading.Thread(
+            target=self._fire_alert,
+            args=(distraction_output, timestamp_sec, self.play_audio),
+            daemon=True
+        ).start()
         return True
 
-    def _fire_alert(self, distraction_output, video_timestamp):
+    def _fire_alert(self, distraction_output, video_timestamp, play_audio):
         try:
-            audio_bytes = generate_safety_alert_all_groq(distraction_output)
+            audio_bytes = generate_safety_alert_all_groq(distraction_output, play_audio=play_audio)
             if isinstance(audio_bytes, bytes) and audio_bytes:
                 with self.alert_log_lock:
                     self.alert_log.append((video_timestamp, audio_bytes))
@@ -211,37 +265,78 @@ class DetectionState:
                 self.alert_active = False
 
     def _annotate(self, frame, w, h):
-        if self.last_detection_result is None:
-            return frame.copy()
-        r = self.last_detection_result
-        mp_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        out = draw_landmarks_on_image(mp_frame, r["hand_result"])
-        out = draw_pose_markers(out, r["pose_result"], w, h)
-        if r["steering_box"]:
-            x1, y1, x2, y2 = r["steering_box"]
-            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 8)
-            cv2.putText(out, "Steering Wheel", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
-        y = 100
-        for side, key in [("LEFT", "left"), ("RIGHT", "right")]:
-            is_on = self.confirmed_hand_state[key]
-            cv2.putText(out, f"{side}: {'ON' if is_on else 'OFF'}", (50, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 255, 0) if is_on else (0, 0, 255), 6)
-            y += 100
-        
-        # Display action recognition result
-        if self.latest_action_result:
-            action_text = f"Action: {self.latest_action_result['predicted_class']}"
-            confidence_text = f"Confidence: {self.latest_action_result['confidence']:.2%}"
-            
-            # Determine color based on confidence threshold
-            conf_value = self.latest_action_result['confidence']
-            color = (0, 165, 255) if conf_value > ACTION_CONFIDENCE_THRESHOLD else (100, 100, 255)  # orange if alert threshold, light red otherwise
-            
-            cv2.putText(out, action_text, (50, h - 120),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-            cv2.putText(out, confidence_text, (50, h - 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-        
+        out = frame.copy()
+
+        # -- Mediapipe overlays (landmarks, pose, steering box, hand labels) --
+        if self.mediapipe_enabled and self.last_detection_result is not None:
+            r = self.last_detection_result
+            rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+            # draw_landmarks_on_image accepts RGB but returns BGR internally
+            out = draw_landmarks_on_image(rgb, r["hand_result"])
+            # draw_pose_markers expects BGR and returns BGR
+            out = draw_pose_markers(out, r["pose_result"], w, h)
+
+            if r["steering_box"]:
+                x1, y1, x2, y2 = r["steering_box"]
+                cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                cv2.putText(out, "Steering Wheel", (x1, y1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+                # Hand labels inside the steering wheel box
+                label_x = x1 + 8
+                label_y = y2 - 10
+                for side, key in [("Left Hand", "left"), ("Right Hand", "right")]:
+                    is_on = self.confirmed_hand_state[key]
+                    color = (0, 255, 0) if is_on else (0, 0, 255)
+                    text = f"{side}: {'ON' if is_on else 'OFF'}"
+                    cv2.putText(out, text, (label_x, label_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+                    label_y -= 24
+            else:
+                # No steering box — draw hand labels at default corner
+                label_y = 30
+                for side, key in [("Left Hand", "left"), ("Right Hand", "right")]:
+                    is_on = self.confirmed_hand_state[key]
+                    color = (0, 255, 0) if is_on else (0, 0, 255)
+                    text = f"{side}: {'ON' if is_on else 'OFF'}"
+                    cv2.putText(out, text, (10, label_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+                    label_y += 24
+
+        # -- Action recognition overlay (annotate_video.py draw_overlay style) --
+        if self.videomae_enabled and self.latest_action_result:
+            ar = self.latest_action_result
+            label = ar["predicted_class"].replace("_", " ").title()
+            confidence = ar["confidence"]
+            top3 = ar.get("top_k", [])
+
+            overlay = out.copy()
+            box_h = 90
+            # Semi-transparent dark box at bottom
+            cv2.rectangle(overlay, (0, h - box_h), (w, h), (20, 20, 20), -1)
+            out = cv2.addWeighted(overlay, 0.55, out, 0.45, 0)
+
+            # Main label
+            cv2.putText(out, label, (12, h - box_h + 30),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # Confidence percentage
+            conf_text = f"{confidence * 100:.1f}%"
+            cv2.putText(out, conf_text, (12, h - box_h + 58),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.6, (100, 230, 100), 1, cv2.LINE_AA)
+
+            # Top-3 mini bar chart (right side)
+            bar_x = w - 240
+            for rank, (cls, score) in enumerate(top3[:3]):
+                bar_y = h - box_h + 18 + rank * 24
+                bar_len = int(score * 180)
+                bar_col = (100, 230, 100) if rank == 0 else (180, 180, 180)
+                cv2.rectangle(out, (bar_x, bar_y - 10), (bar_x + bar_len, bar_y + 4), bar_col, -1)
+                short_cls = cls.replace("_", " ")[:18]
+                cv2.putText(out, f"{short_cls} {score*100:.0f}%",
+                            (bar_x, bar_y + 3), cv2.FONT_HERSHEY_DUPLEX, 0.38,
+                            (255, 255, 255), 1, cv2.LINE_AA)
+
         return out
 
 
@@ -276,7 +371,6 @@ def _run_upload_pipeline(job_id: str, video_path: str):
 
     try:
         _update_job(job_id, status="processing")
-        state = DetectionState()
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -286,6 +380,10 @@ def _run_upload_pipeline(job_id: str, video_path: str):
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        state = DetectionState(fps=fps, play_audio=False)
+        with jobs_lock:
+            job["detection_state"] = state
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -296,6 +394,9 @@ def _run_upload_pipeline(job_id: str, video_path: str):
 
         frame_count = 0
         while cap.isOpened():
+            if state.paused:
+                time.sleep(0.1)
+                continue
             ret, frame = cap.read()
             if not ret:
                 break
@@ -347,9 +448,9 @@ def _run_upload_pipeline(job_id: str, video_path: str):
             if pcm:
                 mux_audio_into_video(silent_path, final_path, pcm, total_duration)
             else:
-                os.rename(silent_path, final_path)
+                _convert_to_h264(silent_path, final_path)
         else:
-            os.rename(silent_path, final_path)
+            _convert_to_h264(silent_path, final_path)
 
         if os.path.exists(final_path) and os.path.exists(silent_path):
             os.remove(silent_path)
@@ -376,8 +477,8 @@ def get_job(job_id: str):
         job = jobs.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    # Don't expose queues to the client
-    return {k: v for k, v in job.items() if k not in ("frame_queue", "event_queue")} | {"job_id": job_id}
+    # Don't expose queues or internal objects to the client
+    return {k: v for k, v in job.items() if k not in ("frame_queue", "event_queue", "detection_state")} | {"job_id": job_id}
 
 
 @app.get("/output/{job_id}")
@@ -410,6 +511,40 @@ async def stream_upload_frames(websocket: WebSocket, job_id: str):
     eq: queue.Queue = job["event_queue"]
     loop = asyncio.get_event_loop()
 
+    # Background task to listen for toggle messages without blocking the frame loop
+    async def _listen_toggles():
+        try:
+            while True:
+                msg = await websocket.receive_text()
+                data = json.loads(msg)
+                if data.get("type") == "toggle":
+                    with jobs_lock:
+                        ds = job.get("detection_state")
+                    if ds:
+                        target = data.get("target")
+                        enabled = data.get("enabled", True)
+                        if target == "mediapipe":
+                            ds.mediapipe_enabled = enabled
+                        elif target == "videomae":
+                            ds.videomae_enabled = enabled
+                elif data.get("type") == "pause":
+                    with jobs_lock:
+                        ds = job.get("detection_state")
+                    if ds:
+                        ds.paused = data.get("paused", False)
+                elif data.get("type") == "config":
+                    with jobs_lock:
+                        ds = job.get("detection_state")
+                    if ds:
+                        key = data.get("key")
+                        val = data.get("value")
+                        if key == "action_interval":
+                            ds.action_interval_sec = float(val)
+        except (WebSocketDisconnect, Exception):
+            pass
+
+    listener = asyncio.create_task(_listen_toggles())
+
     try:
         while True:
             # Drain pending alert events first (non-blocking)
@@ -426,7 +561,7 @@ async def stream_upload_frames(websocket: WebSocket, job_id: str):
             try:
                 frame_bytes = await asyncio.wait_for(
                     loop.run_in_executor(None, fq.get),
-                    timeout=30.0,
+                    timeout=600.0,
                 )
             except asyncio.TimeoutError:
                 break
@@ -440,13 +575,14 @@ async def stream_upload_frames(websocket: WebSocket, job_id: str):
 
     except WebSocketDisconnect:
         pass
+    finally:
+        listener.cancel()
 
 
 # ── WebSocket — live webcam ────────────────────────────────────────────────────
 @app.websocket("/stream/webcam")
 async def stream_webcam(websocket: WebSocket, cam_index: int = 0):
     await websocket.accept()
-    state = DetectionState()
 
     cap = cv2.VideoCapture(cam_index)
     if not cap.isOpened():
@@ -456,6 +592,30 @@ async def stream_webcam(websocket: WebSocket, cam_index: int = 0):
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     frame_delay = 1.0 / fps
+    state = DetectionState(fps=fps, play_audio=True)
+
+    # Background task to listen for toggle messages without blocking the frame loop
+    async def _listen_toggles():
+        try:
+            while True:
+                msg = await websocket.receive_text()
+                data = json.loads(msg)
+                if data.get("type") == "toggle":
+                    target = data.get("target")
+                    enabled = data.get("enabled", True)
+                    if target == "mediapipe":
+                        state.mediapipe_enabled = enabled
+                    elif target == "videomae":
+                        state.videomae_enabled = enabled
+                elif data.get("type") == "config":
+                    key = data.get("key")
+                    val = data.get("value")
+                    if key == "action_interval":
+                        state.action_interval_sec = float(val)
+        except (WebSocketDisconnect, Exception):
+            pass
+
+    listener = asyncio.create_task(_listen_toggles())
 
     try:
         while True:
@@ -476,4 +636,5 @@ async def stream_webcam(websocket: WebSocket, cam_index: int = 0):
     except WebSocketDisconnect:
         pass
     finally:
+        listener.cancel()
         cap.release()

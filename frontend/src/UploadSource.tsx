@@ -10,10 +10,14 @@ export function UploadSource() {
   const { job, uploadProgress, upload, reset } = useUploadJob();
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [mediapipeOn, setMediapipeOn] = useState(true);
+  const [videomaeOn, setVideomaeOn] = useState(true);
+  const [isPaused, setIsPaused] = useState(false);
+  const [actionInterval, setActionInterval] = useState(1.0);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const wsUrl = job ? `${API_WS}/stream/upload/${job.job_id}` : null;
-  const { status: streamStatus, frameUrl, alerts, handState, connect, disconnect } = useVideoStream(wsUrl);
+  const { status: streamStatus, frameUrl, alerts, handState, connect, disconnect, sendMessage } = useVideoStream(wsUrl);
 
   const handleFile = (f: File) => {
     setFile(f);
@@ -29,6 +33,10 @@ export function UploadSource() {
 
   const handleStart = async () => {
     if (!file) return;
+    setIsPaused(false);
+    setMediapipeOn(true);
+    setVideomaeOn(true);
+    setActionInterval(1.0);
     await upload(file); // Upload first, get job_id - WebSocket will connect automatically
   };
 
@@ -36,6 +44,10 @@ export function UploadSource() {
     disconnect();
     reset();
     setFile(null);
+    setIsPaused(false);
+    setMediapipeOn(true);
+    setVideomaeOn(true);
+    setActionInterval(1.0);
   };
 
   const isRunning = job && (job.status === "queued" || job.status === "processing");
@@ -55,7 +67,36 @@ export function UploadSource() {
       progress={job?.progress}
     >
       {/* ── controls slot ── */}
-      <div style={{ display: "flex", gap: 6 }}>
+      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        {isRunning && (
+          <>
+            <ToggleButton label="MediaPipe" on={mediapipeOn} disabled={streamStatus !== "streaming"} onClick={() => {
+              const next = !mediapipeOn;
+              setMediapipeOn(next);
+              sendMessage({ type: "toggle", target: "mediapipe", enabled: next });
+            }} />
+            <ToggleButton label="VideoMAE" on={videomaeOn} disabled={streamStatus !== "streaming"} onClick={() => {
+              const next = !videomaeOn;
+              setVideomaeOn(next);
+              sendMessage({ type: "toggle", target: "videomae", enabled: next });
+            }} />
+            <select
+              value={actionInterval}
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                setActionInterval(val);
+                sendMessage({ type: "config", key: "action_interval", value: val });
+              }}
+              style={selectStyle}
+              disabled={streamStatus !== "streaming"}
+            >
+              <option value={0.5}>Interval: 0.5s</option>
+              <option value={1.0}>Interval: 1.0s</option>
+              <option value={1.5}>Interval: 1.5s</option>
+              <option value={2.0}>Interval: 2.0s</option>
+            </select>
+          </>
+        )}
         {isDone && job?.job_id && (
           <>
             <button
@@ -92,6 +133,19 @@ export function UploadSource() {
               ↓ download
             </a>
           </>
+        )}
+        {isRunning && (
+          <button
+            onClick={() => {
+              const next = !isPaused;
+              setIsPaused(next);
+              sendMessage({ type: "pause", paused: next });
+            }}
+            style={isPaused ? playBtnStyle : pauseBtnStyle}
+            disabled={streamStatus !== "streaming"}
+          >
+            {isPaused ? "▶ play" : "⏸ pause"}
+          </button>
         )}
         {(file || job) && (
           <button onClick={handleReset} style={ghostBtnStyle}>clear</button>
@@ -212,6 +266,41 @@ function StatChip({ label, value, color }: { label: string; value: string; color
   );
 }
 
+function ToggleButton({ label, on, disabled, onClick }: { label: string; on: boolean; disabled?: boolean; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+        fontSize: 9, fontWeight: 600, padding: "4px 10px",
+        borderRadius: 12, letterSpacing: "0.04em",
+        cursor: disabled ? "not-allowed" : "pointer",
+        transition: "all 0.2s ease",
+        border: on 
+          ? (disabled ? "1px solid rgba(0,255,100,0.15)" : "1px solid rgba(0,255,100,0.4)") 
+          : "1px solid rgba(255,255,255,0.15)",
+        background: on 
+          ? (disabled ? "rgba(0,255,100,0.04)" : "rgba(0,255,100,0.12)") 
+          : "rgba(255,255,255,0.04)",
+        color: on 
+          ? (disabled ? "rgba(0,255,100,0.3)" : "#4ade80") 
+          : "rgba(255,255,255,0.35)",
+        opacity: disabled ? 0.5 : 1,
+      }}
+    >
+      <span style={{
+        display: "inline-block", width: 6, height: 6, borderRadius: "50%",
+        background: on ? "#4ade80" : "rgba(255,255,255,0.2)",
+        marginRight: 5, verticalAlign: "middle",
+        boxShadow: on && !disabled ? "0 0 6px #4ade80" : "none",
+        transition: "all 0.2s ease",
+      }} />
+      {label}
+    </button>
+  );
+}
+
 const monoSmall: React.CSSProperties = {
   fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
   fontSize: 9, letterSpacing: "0.06em", color: "rgba(255,255,255,0.35)",
@@ -236,4 +325,26 @@ const ghostBtnStyle: React.CSSProperties = {
   background: "transparent",
   border: "1px solid rgba(255,255,255,0.15)",
   color: "rgba(255,255,255,0.5)",
+};
+
+const selectStyle: React.CSSProperties = {
+  fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+  fontSize: 9, padding: "4px 8px", borderRadius: 4,
+  border: "1px solid rgba(255,255,255,0.15)",
+  background: "rgba(255,255,255,0.04)", color: "rgba(255,255,255,0.5)",
+  cursor: "pointer", letterSpacing: "0.04em",
+};
+
+const pauseBtnStyle: React.CSSProperties = {
+  ...primaryBtnStyle,
+  background: "rgba(239, 68, 68, 0.1)",
+  border: "1px solid rgba(239, 68, 68, 0.4)",
+  color: "#f87171",
+};
+
+const playBtnStyle: React.CSSProperties = {
+  ...primaryBtnStyle,
+  background: "rgba(34, 197, 94, 0.1)",
+  border: "1px solid rgba(34, 197, 94, 0.4)",
+  color: "#4ade80",
 };

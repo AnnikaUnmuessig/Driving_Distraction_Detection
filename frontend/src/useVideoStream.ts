@@ -72,6 +72,12 @@ export function useVideoStream(url: string | null) {
     setFrameUrl(null);
   }, []);
 
+  const sendMessage = useCallback((msg: object) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(msg));
+    }
+  }, []);
+
   useEffect(() => {
     if (url && !wsRef.current) {
       connect();
@@ -82,5 +88,5 @@ export function useVideoStream(url: string | null) {
 
   useEffect(() => () => { wsRef.current?.close(); }, []);
 
-  return { status, frameUrl, alerts, handState, connect, disconnect };
+  return { status, frameUrl, alerts, handState, connect, disconnect, sendMessage };
 }

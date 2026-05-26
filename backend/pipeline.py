@@ -12,22 +12,24 @@ from action_recognition import ActionRecognizer
 # Fixed variables
 HANDS_OFF_THRESHOLD = 1        # seconds temporarily low
 WHEEL_DETECTION_INTERVAL = 1   # seconds
-TIMESFORMER_WINDOW_SIZE = 16   # number of frames for action classification
-ACTION_OVERLAP = 8             # start new action classification every 8 frames
+VIDEOMAE_WINDOW_SIZE = 16      # number of frames for action classification
+ACTION_OVERLAP = 30             # start new action classification every 30 frames
 DEBOUNCE_THRESHOLD = 3         # number of consecutive detections to confirm state change
 ACTION_CONFIDENCE_THRESHOLD = 0.5  # confidence threshold for action alerts
+EMA_ALPHA = 0.3                # EMA smoothing factor for predictions (1.0 = disabled)
 
 
 class ActionRecognitionWorker:
     """Background thread worker for action recognition inference"""
     
     def __init__(self):
-        self.queue = queue.Queue(maxsize=5)  # buffer up to 5 frame sets
+        self.queue = queue.Queue(maxsize=1)  # buffer up to 1 frame set
         self.latest_result = None
         self.result_lock = threading.Lock()
         self.running = False
         self.recognizer = None
         self.worker_thread = None
+        self.result_id = 0
         
     def start(self):
         """Initialize model and start worker thread"""
@@ -36,32 +38,36 @@ class ActionRecognitionWorker:
             self.running = True
             self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
             self.worker_thread.start()
-            print("✅ Action recognition worker started")
+            print("[OK] Action recognition worker started")
         except Exception as e:
-            print(f"❌ Failed to start action recognizer: {e}")
+            print(f"[ERROR] Failed to start action recognizer: {e}")
             self.running = False
     
     def _worker_loop(self):
         """Continuous loop consuming frame buffers"""
         while self.running:
             try:
-                frames_buffer = self.queue.get(timeout=1)
-                if frames_buffer is None:  # shutdown signal
+                item = self.queue.get(timeout=1)
+                if item is None:  # shutdown signal
                     break
+                frames_buffer, prev_probs = item
                     
-                result = self.recognizer.predict(frames_buffer, top_k=3)
+                result = self.recognizer.predict(frames_buffer, top_k=3, prev_probs=prev_probs, ema_alpha=EMA_ALPHA)
                 with self.result_lock:
+                    self.result_id += 1
+                    if result is not None:
+                        result["result_id"] = self.result_id
                     self.latest_result = result
                     
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"❌ Action recognition error: {e}")
+                print(f"[ERROR] Action recognition error: {e}")
     
-    def queue_frames(self, frames: list):
+    def queue_frames(self, frames: list, prev_probs: list = None):
         """Non-blocking push of frame buffer to queue"""
         try:
-            self.queue.put_nowait(frames)
+            self.queue.put_nowait((frames, prev_probs))
         except queue.Full:
             pass  # silently skip if queue full
     
@@ -105,7 +111,7 @@ def build_audio_track(alert_log, total_duration_seconds):
     if not alert_log:
         return None
     # ── DEBUG: print all alert timestamps ──
-    print(f"\n🔍 DEBUG — {len(alert_log)} alert(s) queued for mixing:")
+    print(f"\n[DEBUG] {len(alert_log)} alert(s) queued for mixing:")
     for i, (ts, audio_bytes) in enumerate(alert_log):
         print(f"   Alert {i+1}: timestamp={ts:.3f}s, size={len(audio_bytes):,} bytes")
 
@@ -174,14 +180,14 @@ def build_audio_track(alert_log, total_duration_seconds):
             t.join(timeout=5)
 
         if proc.returncode != 0:
-            print(f"❌ Audio mix failed:\n{stderr.decode(errors='replace')}")
+            print(f"[ERROR] Audio mix failed:\n{stderr.decode(errors='replace')}")
             return None
 
-        print(f"✅ Mixed audio track: {len(pcm_bytes):,} PCM bytes")
+        print(f"[OK] Mixed audio track: {len(pcm_bytes):,} PCM bytes")
         return pcm_bytes
 
     except Exception as e:
-        print(f"❌ build_audio_track exception: {e}")
+        print(f"[ERROR] build_audio_track exception: {e}")
         for r, w in pipe_pairs:
             for fd in (r, w):
                 try:
@@ -191,10 +197,31 @@ def build_audio_track(alert_log, total_duration_seconds):
         return None
 
 
+def _convert_to_h264(input_path, output_path):
+    """Re-encodes a video file to browser-compatible H.264 using FFmpeg."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+        print(f"[OK] Re-encoded {input_path} to H.264: {output_path}")
+    except Exception as e:
+        print(f"[WARN] H.264 conversion failed: {e}. Falling back to rename.")
+        if os.path.exists(input_path):
+            try:
+                os.rename(input_path, output_path)
+            except Exception as re_err:
+                print(f"[ERROR] Fallback rename failed: {re_err}")
+
+
 def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_duration_seconds):
     """
     Pipes raw PCM bytes into FFmpeg as the audio stream and muxes with the silent video.
-    Audio is hard-trimmed to total_duration_seconds. No temp files are written.
+    Audio is hard-trimmed to total_duration_seconds. Video is re-encoded to H.264.
     """
     cmd = [
         "ffmpeg", "-y",
@@ -205,7 +232,8 @@ def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_
         "-i", "pipe:0",
         "-map", "0:v",
         "-map", "1:a",
-        "-c:v", "copy",             # no video re-encode
+        "-c:v", "libx264",          # re-encode to H.264 for browser compatibility
+        "-pix_fmt", "yuv420p",      # standard pixel format for web playback
         "-c:a", "aac",
         "-t", str(total_duration_seconds),
         "-shortest",
@@ -214,11 +242,11 @@ def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_
 
     try:
         subprocess.run(cmd, input=pcm_bytes, capture_output=True, check=True)
-        print(f"✅ Final video with audio saved to: {final_output_path}")
+        print(f"[OK] Final video with audio saved to: {final_output_path}")
     except subprocess.CalledProcessError as e:
-        print(f"❌ FFmpeg mux failed:\n{e.stderr.decode(errors='replace')}")
-        os.rename(silent_video_path, final_output_path)
-        print(f"⚠️  Falling back to silent video: {final_output_path}")
+        print(f"[ERROR] FFmpeg mux failed:\n{e.stderr.decode(errors='replace')}")
+        _convert_to_h264(silent_video_path, final_output_path)
+        print(f"[WARN] Falling back to silent video: {final_output_path}")
 
 
 def run_pipeline(video_path=None):
@@ -246,7 +274,8 @@ def run_pipeline(video_path=None):
 
     # State tracking
     hands_off_since = None
-    last_wheel_check_time = 0
+    last_roboflow_time = 0
+    cached_steering_box = None
     frames_buffer = []
     frame_count = 0
     last_action_frame = -ACTION_OVERLAP
@@ -270,12 +299,12 @@ def run_pipeline(video_path=None):
             if isinstance(audio_bytes, bytes) and len(audio_bytes) > 0:
                 with alert_log_lock:
                     alert_log.append((video_timestamp, audio_bytes))
-                print(f"🔊 Alert audio captured ({len(audio_bytes):,} bytes) @ {video_timestamp:.2f}s")
+                print(f"[INFO] Alert audio captured ({len(audio_bytes):,} bytes) @ {video_timestamp:.2f}s")
             else:
-                print("⚠️  generate_safety_alert_all_groq returned no bytes")
+                print("[WARN] generate_safety_alert_all_groq returned no bytes")
 
         except Exception as e:
-            print(f"❌ Alert failed: {e}")
+            print(f"[ERROR] Alert failed: {e}")
         finally:
             with alert_lock:
                 alert_active = False
@@ -285,12 +314,12 @@ def run_pipeline(video_path=None):
 
         with alert_lock:
             if alert_active:
-                print(f"   ❌ Blocked — alert already active")
+                print(f"   [BLOCKED] Alert already active")
                 return False
             alert_active = True
             video_timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-        print(f"🚨 Alert fired at video_time={video_timestamp:.3f}s")
+        print(f"[ALERT] Fired at video_time={video_timestamp:.3f}s")
 
         threading.Thread(
             target=fire_alert,
@@ -309,81 +338,84 @@ def run_pipeline(video_path=None):
         frame_count += 1
 
         # ── 1. STEERING WHEEL + HAND DETECTION ──
-        # ── 1. STEERING WHEEL + HAND DETECTION ──
-        if current_time - last_wheel_check_time >= WHEEL_DETECTION_INTERVAL:
-            last_wheel_check_time = current_time
+        run_roboflow = False
+        if current_time - last_roboflow_time >= 30.0 or cached_steering_box is None:
+            run_roboflow = True
+            last_roboflow_time = current_time
 
-            # Current detection call
-            result = detect_steering_and_hands(frame)
- 
-            # If current detection returned no box, but we have a previous result,
-            # pull the steering_box from that last_detection_result.
-            if result["steering_box"] is None and last_detection_result is not None:
-                if last_detection_result.get("steering_box") is not None:
-                    result["steering_box"] = last_detection_result["steering_box"]
-                    print("   ⚠️  Steering wheel not detected — using last known box as fallback.")
-                    # Optionally, you could print a log here to know it's falling back
-                    # print("Using cached steering wheel box")
+        # Run MediaPipe on every frame, passing the cached box if Roboflow is skipped
+        result = detect_steering_and_hands(frame, steering_box=None if run_roboflow else cached_steering_box)
 
-            # Now, update the cache with this 'result' (which now contains the old box if needed)
-            last_detection_result = result              
+        if run_roboflow:
+            if result["steering_box"] is not None:
+                cached_steering_box = result["steering_box"]
+            elif last_detection_result is not None and last_detection_result.get("steering_box") is not None:
+                result["steering_box"] = last_detection_result["steering_box"]
+                cached_steering_box = last_detection_result["steering_box"]
+                print("   [WARN] Steering wheel not detected — using last known box as fallback.")
+        else:
+            result["steering_box"] = cached_steering_box
 
-            new_state = {
-                "left": result["left_hand_on"],
-                "right": result["right_hand_on"]
-            }
+        last_detection_result = result              
 
-            # ── Debounce logic ──
-            if new_state == confirmed_hand_state:
+        new_state = {
+            "left": result["left_hand_on"],
+            "right": result["right_hand_on"]
+        }
+
+        # ── Debounce logic ──
+        if new_state == confirmed_hand_state:
+            pending_hand_state = None
+            pending_count = 0
+        elif new_state == pending_hand_state:
+            pending_count += 1
+            if pending_count >= DEBOUNCE_THRESHOLD:
+                print(f"State change confirmed: {confirmed_hand_state} → {new_state}")
+                confirmed_hand_state = new_state
                 pending_hand_state = None
                 pending_count = 0
-            elif new_state == pending_hand_state:
-                pending_count += 1
-                if pending_count >= DEBOUNCE_THRESHOLD:
-                    print(f"State change confirmed: {confirmed_hand_state} → {new_state}")
-                    confirmed_hand_state = new_state
-                    pending_hand_state = None
-                    pending_count = 0
-            else:
-                pending_hand_state = new_state
-                pending_count = 1
+        else:
+            pending_hand_state = new_state
+            pending_count = 1
 
-            # ── Use confirmed_hand_state for alert logic ──
-            hands_on_wheel = confirmed_hand_state["left"] and confirmed_hand_state["right"]
+        # ── Use confirmed_hand_state for alert logic ──
+        hands_on_wheel = confirmed_hand_state["left"] and confirmed_hand_state["right"]
 
-            if hands_on_wheel:
-                hands_off_since = None
-            else:
-                if hands_off_since is None:
-                    hands_off_since = current_time
+        if hands_on_wheel:
+            hands_off_since = None
+        else:
+            if hands_off_since is None:
+                hands_off_since = current_time
 
-                hands_off_duration = current_time - hands_off_since
+            hands_off_duration = current_time - hands_off_since
+            # Print status periodically rather than every single frame to avoid spam
+            if frame_count % 15 == 0:
                 print(f"Hands off wheel for {hands_off_duration:.1f}s")
 
-                if hands_off_duration >= HANDS_OFF_THRESHOLD:
-                    alert_was_fired = trigger_alert({
-                        "distracted": "yes",
-                        "distraction_type": "hands off wheel",
-                        "type of warning": "mid-heavy"
-                    })
-                    hands_off_since = current_time
+            if hands_off_duration >= HANDS_OFF_THRESHOLD:
+                alert_was_fired = trigger_alert({
+                    "distracted": "yes",
+                    "distraction_type": "hands off wheel",
+                    "type of warning": "mid-heavy"
+                })
+                hands_off_since = current_time
 
-                    if alert_was_fired:
-                        print("📢 Alert started - Blocking new triggers until voice finishes.")
+                if alert_was_fired:
+                    print("[ALERT] Started - Blocking new triggers until voice finishes.")
 
         # ── 2. ACTION CLASSIFICATION ──
         frames_buffer.append(frame)
-        if len(frames_buffer) > TIMESFORMER_WINDOW_SIZE:
+        if len(frames_buffer) > VIDEOMAE_WINDOW_SIZE:
             frames_buffer.pop(0)
 
-        if (len(frames_buffer) == TIMESFORMER_WINDOW_SIZE and
+        if (len(frames_buffer) == VIDEOMAE_WINDOW_SIZE and
                 frame_count - last_action_frame >= ACTION_OVERLAP):
 
             last_action_frame = frame_count
             action = classify_action(frames_buffer)
 
             if action:
-                print(f"⚠️  Distraction detected: {action}")
+                print(f"[WARN] Distraction detected: {action}")
                 trigger_alert({
                     "distracted": "yes",
                     "distraction_type": action,
@@ -439,13 +471,13 @@ def run_pipeline(video_path=None):
     cap.release()
     if out:
         out.release()
-        print(f"✅ Silent annotated video saved to: {silent_output_path}")
+        print(f"[OK] Silent annotated video saved to: {silent_output_path}")
 
     cv2.destroyAllWindows()
 
     # ── 4. WAIT FOR IN-FLIGHT ALERT THREADS (up to 15 s) ──
     if video_path:
-        print("⏳ Waiting for alert audio threads to finish...")
+        print("[INFO] Waiting for alert audio threads to finish...")
         deadline = time.time() + 15
         while time.time() < deadline:
             with alert_lock:
@@ -462,7 +494,7 @@ def run_pipeline(video_path=None):
             captured_alerts = list(alert_log)
 
         if captured_alerts:
-            print(f"🎚️  Mixing {len(captured_alerts)} alert(s) entirely in memory...")
+            print(f"[INFO] Mixing {len(captured_alerts)} alert(s) entirely in memory...")
             pcm_bytes = build_audio_track(captured_alerts, total_duration_seconds)
 
             if pcm_bytes:
@@ -471,15 +503,16 @@ def run_pipeline(video_path=None):
                     pcm_bytes, total_duration_seconds
                 )
             else:
-                print("⚠️  Audio mixing produced no output — saving silent video.")
-                os.rename(silent_output_path, final_output_path)
+                print("[WARN] Audio mixing produced no output — encoding silent video to H.264.")
+                _convert_to_h264(silent_output_path, final_output_path)
         else:
-            print("ℹ️  No alerts fired — saving video without audio.")
-            os.rename(silent_output_path, final_output_path)
+            print("[INFO] No alerts fired — encoding video to H.264 without audio.")
+            _convert_to_h264(silent_output_path, final_output_path)
 
         # Clean up intermediate silent file
         if os.path.exists(final_output_path) and os.path.exists(silent_output_path):
             os.remove(silent_output_path)
 
 
-run_pipeline("test_data/full_videos/gB_10_s2_2019-03-11T15;15;21+01;00_rgb_body.mp4")
+if __name__ == "__main__":
+    run_pipeline("test_data/full_videos/gB_10_s2_2019-03-11T15;15;21+01;00_rgb_body.mp4")
