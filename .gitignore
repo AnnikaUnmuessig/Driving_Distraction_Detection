@@ -17,3 +17,5 @@ backend/__pycache__/*
 frontend/node_modules/
 frontend/build/*
 frontend/__pycache__/*
+scripts/__pycache__/*
+backend/test*

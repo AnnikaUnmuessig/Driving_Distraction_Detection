@@ -27,3 +27,5 @@ mediapipe
 simpleaudio
 groq
 pydub
+wandb
+

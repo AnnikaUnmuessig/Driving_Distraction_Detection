@@ -16,7 +16,7 @@ VIDEOMAE_WINDOW_SIZE = 16      # number of frames for action classification
 ACTION_OVERLAP = 30             # start new action classification every 30 frames
 DEBOUNCE_THRESHOLD = 3         # number of consecutive detections to confirm state change
 ACTION_CONFIDENCE_THRESHOLD = 0.5  # confidence threshold for action alerts
-EMA_ALPHA = 0.3                # EMA smoothing factor for predictions (1.0 = disabled)
+EMA_ALPHA = 1.0                # Deprecated, no longer used
 
 
 class ActionRecognitionWorker:
@@ -50,9 +50,9 @@ class ActionRecognitionWorker:
                 item = self.queue.get(timeout=1)
                 if item is None:  # shutdown signal
                     break
-                frames_buffer, prev_probs = item
+                frames_buffer = item
                     
-                result = self.recognizer.predict(frames_buffer, top_k=3, prev_probs=prev_probs, ema_alpha=EMA_ALPHA)
+                result = self.recognizer.predict(frames_buffer, top_k=3)
                 with self.result_lock:
                     self.result_id += 1
                     if result is not None:
@@ -64,10 +64,10 @@ class ActionRecognitionWorker:
             except Exception as e:
                 print(f"[ERROR] Action recognition error: {e}")
     
-    def queue_frames(self, frames: list, prev_probs: list = None):
+    def queue_frames(self, frames: list):
         """Non-blocking push of frame buffer to queue"""
         try:
-            self.queue.put_nowait((frames, prev_probs))
+            self.queue.put_nowait(frames)
         except queue.Full:
             pass  # silently skip if queue full
     
@@ -202,6 +202,7 @@ def _convert_to_h264(input_path, output_path):
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
+        "-vf", "yadif",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         output_path
@@ -232,6 +233,7 @@ def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_
         "-i", "pipe:0",
         "-map", "0:v",
         "-map", "1:a",
+        "-vf", "yadif",
         "-c:v", "libx264",          # re-encode to H.264 for browser compatibility
         "-pix_fmt", "yuv420p",      # standard pixel format for web playback
         "-c:a", "aac",
@@ -264,7 +266,7 @@ def run_pipeline(video_path=None):
     silent_output_path = None
     if video_path:
         silent_output_path = video_path.rsplit(".", 1)[0] + "_annotated_silent.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")
         out = cv2.VideoWriter(silent_output_path, fourcc, fps, (frame_w, frame_h))
         print(f"Saving annotated video (silent) to: {silent_output_path}")
 

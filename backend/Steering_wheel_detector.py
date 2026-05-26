@@ -61,22 +61,7 @@ def draw_landmarks_on_image(rgb_image, hand_results):
     return annotated_image
 
 def draw_pose_markers(bgr_image, pose_results, img_w, img_h):
-    """Draws wrist/elbow markers using the Tasks API result."""
-    if not pose_results.pose_landmarks:
-        return bgr_image
-
-    lms = pose_results.pose_landmarks[0]
-
-    # Indices: 15=L_Wrist, 16=R_Wrist, 13=L_Elbow, 14=R_Elbow
-    keypoints = {"L Wrist": lms[15], "R Wrist": lms[16], "L Elbow": lms[13], "R Elbow": lms[14]}
-
-    for name, lm in keypoints.items():
-        if lm.visibility < 0.4: continue
-        px, py = int(lm.x * img_w), int(lm.y * img_h)
-        color = (255, 128, 0) if "L" in name else (0, 128, 255)
-        shape = cv2.MARKER_CROSS if "Elbow" in name else cv2.MARKER_STAR
-        cv2.drawMarker(bgr_image, (px, py), color, markerType=shape, markerSize=25, thickness=2)
-        cv2.putText(bgr_image, name, (px + 5, py - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    """Draws wrist/elbow markers using the Tasks API result (Disabled)."""
     return bgr_image
 
 

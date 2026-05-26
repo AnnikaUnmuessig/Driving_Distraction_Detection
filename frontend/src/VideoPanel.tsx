@@ -60,11 +60,7 @@ export function VideoPanel({
           <EmptyState status={status} />
         )}
 
-        {/* scanline overlay */}
-        <div style={{
-          position: "absolute", inset: 0, pointerEvents: "none",
-          backgroundImage: "repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.08) 2px, rgba(0,0,0,0.08) 4px)",
-        }} />
+
 
         {/* corner brackets */}
         {["tl","tr","bl","br"].map(c => <CornerBracket key={c} corner={c as any} />)}

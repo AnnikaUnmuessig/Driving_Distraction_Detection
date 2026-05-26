@@ -138,8 +138,8 @@ def infer_segment(
     logits = model(**inputs).logits                   # (1, num_classes)
     probs  = F.softmax(logits, dim=-1).squeeze(0).cpu().tolist()
 
-    if prev_probs is not None and ema_alpha < 1.0:
-        probs = [ema_alpha * p + (1.0 - ema_alpha) * pp for p, pp in zip(probs, prev_probs)]
+    # EMA is deprecated and disabled
+
 
     id2label    = model.config.id2label
     top_indices = sorted(range(len(probs)), key=lambda i: probs[i], reverse=True)
@@ -217,7 +217,7 @@ def annotate_video(
 
     print(f'[INFO] Input  : {input_path}')
     print(f'[INFO] Output : {output_path}')
-    print(f'[INFO] Model  : {model_class} | Interval: {interval_sec}s | Frames/segment: {num_frames} | EMA Alpha: {ema_alpha}')
+    print(f'[INFO] Model  : {model_class} | Interval: {interval_sec}s | Frames/segment: {num_frames} | EMA: Disabled')
 
     # ── Load model ────────────────────────────────────────────────────────────
     processor, model, device = load_model(model_dir, model_class)

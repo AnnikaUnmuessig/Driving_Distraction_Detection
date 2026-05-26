@@ -115,7 +115,11 @@ def download_dataset_partial(output_dir, videos_per_class, seed=42):
     flat_list: list[tuple[str, str]] = []   # (class_name, repo_path)
     for cls, files in by_class.items():
         rng.shuffle(files)
-        selected = files[:videos_per_class]
+        if isinstance(videos_per_class, dict):
+            limit = videos_per_class.get(cls, None)
+        else:
+            limit = videos_per_class
+        selected = files[:limit] if limit is not None else files
         plan[cls] = selected
         flat_list.extend((cls, p) for p in selected)
         print(f"  {cls:25s}: {len(selected):4d} / {len(files)} videos selected")
@@ -161,6 +165,39 @@ def download_dataset_partial(output_dir, videos_per_class, seed=42):
     return dataset_dir
 
 
+def parse_videos_per_class(value):
+    if not value or value.lower() in ("none", "null"):
+        return None
+    # 1. Try if it's a simple integer
+    if value.isdigit():
+        return int(value)
+    # 2. Try parsing as JSON dict
+    try:
+        import json
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return {k: (int(v) if v is not None else None) for k, v in parsed.items()}
+    except Exception:
+        pass
+    # 3. Try parsing as comma-separated key-value pairs (e.g. safe_driving:179,talking_to_passenger:0)
+    try:
+        mapping = {}
+        for item in value.split(","):
+            if not item.strip():
+                continue
+            k, v = item.split(":")
+            k = k.strip()
+            v = v.strip()
+            mapping[k] = None if v.lower() in ("none", "null") else int(v)
+        return mapping
+    except Exception:
+        pass
+    raise argparse.ArgumentTypeError(
+        f"Invalid videos_per_class value: '{value}'. "
+        "Must be an integer, a JSON dictionary, or a key:value list (e.g., safe_driving:100,drinking:150)"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download HuggingFace model and dataset for offline training."
@@ -173,10 +210,10 @@ def main():
     )
     parser.add_argument(
         "--videos_per_class",
-        type=int,
+        type=parse_videos_per_class,
         default=None,
         metavar="N",
-        help="Download only N videos per class folder instead of the full dataset. "
+        help="Download N videos per class folder (or class-specific caps via JSON/comma-separated key-values). "
              "Useful on Colab/Kaggle to avoid downloading ~13 GB. "
              "(default: None = download everything)",
     )

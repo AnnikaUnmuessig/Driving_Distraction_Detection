@@ -39,7 +39,6 @@ from pipeline import (
     VIDEOMAE_WINDOW_SIZE,
     WHEEL_DETECTION_INTERVAL,
     ACTION_CONFIDENCE_THRESHOLD,
-    EMA_ALPHA,
 )
 
 UPLOAD_DIR = Path("uploads")
@@ -102,7 +101,7 @@ class DetectionState:
         self.confirmed_hand_state: dict = {"left": True, "right": True}
         self.pending_hand_state: Optional[dict] = None
         self.pending_count: int = 0
-        self.alert_active: bool = False
+        self.active_alert_threads: int = 0
         self.alert_lock = threading.Lock()
         self.alert_log: list = []
         self.alert_log_lock = threading.Lock()
@@ -113,8 +112,6 @@ class DetectionState:
         self.videomae_enabled: bool = True
         self.paused: bool = False
 
-        # EMA smoothing state
-        self.prev_probs: Optional[list] = None
 
         # Action recognition worker
         self.action_worker = ActionRecognitionWorker()
@@ -207,7 +204,7 @@ class DetectionState:
                 n = len(self.frames_buffer)
                 indices = np.linspace(0, n - 1, 16, dtype=int)
                 sampled_frames = [self.frames_buffer[i] for i in indices]
-                self.action_worker.queue_frames(sampled_frames, prev_probs=self.prev_probs)
+                self.action_worker.queue_frames(sampled_frames)
 
             # Read latest prediction result (polled on every single frame)
             result = self.action_worker.get_result()
@@ -215,10 +212,6 @@ class DetectionState:
                 result_id = result.get("result_id", 0)
                 if result_id > self.last_processed_result_id:
                     self.last_processed_result_id = result_id
-                    
-                    # Track EMA probs
-                    if "probs" in result:
-                        self.prev_probs = result["probs"]
                     self.latest_action_result = result
                     
                     if result.get("confidence", 0) > ACTION_CONFIDENCE_THRESHOLD:
@@ -236,14 +229,11 @@ class DetectionState:
 
     def _trigger_alert(self, distraction_output, timestamp_sec):
         # Cooldown of 3.5 seconds in video timeline time (or wall-clock time for webcam)
-        if timestamp_sec - self.last_alert_time < 3.5:
-            return False
-
         with self.alert_lock:
-            if self.alert_active:
+            if timestamp_sec - self.last_alert_time < 3.5:
                 return False
-            self.alert_active = True
             self.last_alert_time = timestamp_sec
+            self.active_alert_threads += 1
 
         threading.Thread(
             target=self._fire_alert,
@@ -262,7 +252,7 @@ class DetectionState:
             print(f"Alert error: {e}")
         finally:
             with self.alert_lock:
-                self.alert_active = False
+                self.active_alert_threads -= 1
 
     def _annotate(self, frame, w, h):
         out = frame.copy()
@@ -389,7 +379,7 @@ def _run_upload_pipeline(job_id: str, video_path: str):
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         silent_path = str(OUTPUT_DIR / f"{job_id}_silent.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")
         out_writer = cv2.VideoWriter(silent_path, fourcc, fps, (w, h))
 
         frame_count = 0
@@ -434,7 +424,7 @@ def _run_upload_pipeline(job_id: str, video_path: str):
         deadline = time.time() + 15
         while time.time() < deadline:
             with state.alert_lock:
-                still = state.alert_active
+                still = state.active_alert_threads > 0
             if not still:
                 break
             time.sleep(0.2)

@@ -100,7 +100,37 @@ OUTPUT_DIR   = os.environ.get("OUTPUT_DIR",   "./videomae_outputs")
 HF_REPO_ID   = os.environ.get("HF_REPO_ID",  "")   # e.g. "username/videomae-distraction"
 
 NUM_FRAMES = 16     # VideoMAE-Base native frame count
-LIMIT_CAP  = 160    # max clips per class (None = no cap)
+def parse_limit_cap(value):
+    if not value or value.lower() in ("none", "null", "false", ""):
+        return None
+    if value.isdigit():
+        return int(value)
+    try:
+        import json
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return {k: (int(v) if v is not None else None) for k, v in parsed.items()}
+    except Exception:
+        pass
+    try:
+        mapping = {}
+        for item in value.split(","):
+            if not item.strip():
+                continue
+            k, v = item.split(":")
+            k = k.strip()
+            v = v.strip()
+            mapping[k] = None if v.lower() in ("none", "null") else int(v)
+        return mapping
+    except Exception:
+        pass
+    return value
+
+_limit_cap_env = os.environ.get("LIMIT_CAP")
+if _limit_cap_env is not None:
+    LIMIT_CAP = parse_limit_cap(_limit_cap_env)
+else:
+    LIMIT_CAP = 160
 SEED       = 42
 
 # Memory tuning via env vars
@@ -142,8 +172,12 @@ def build_entries(dataset_path, class_map, limit_cap=None, seed=42):
             if f.lower().endswith((".mp4", ".avi", ".mov"))
         ]
         rng.shuffle(videos)
-        if limit_cap and len(videos) > limit_cap:
-            videos = videos[:limit_cap]
+        if isinstance(limit_cap, dict):
+            this_cap = limit_cap.get(class_name, None)
+        else:
+            this_cap = limit_cap
+        if this_cap is not None and len(videos) > this_cap:
+            videos = videos[:this_cap]
         for v in videos:
             entries.append((v, label))
         print(f"  {class_name:25s}: {len(videos):4d} clips")
@@ -460,6 +494,42 @@ def main():
     plt.savefig(cm_path, dpi=150)
     plt.close()
     print(f"Confusion matrix saved to {cm_path}")
+
+    # ── Weights & Biases Logging (if active) ──────────────────────────────────
+    try:
+        import wandb
+        if wandb.run is not None:
+            print("\nLogging test metrics, classification report and confusion matrix to WandB...")
+            # 1. Log simple test metrics
+            for k, v in test_results.metrics.items():
+                clean_key = k.replace("test_", "test/")
+                wandb.run.summary[clean_key] = v
+            
+            # 2. Log classification report per-class metrics
+            report = classification_report(
+                labels, preds,
+                target_names=[ID2LABEL[i] for i in range(NUM_CLASSES)],
+                output_dict=True,
+                zero_division=0
+            )
+            for name, metrics in report.items():
+                if isinstance(metrics, dict):
+                    for metric_name, val in metrics.items():
+                        wandb.run.summary[f"test/class_{name}/{metric_name}"] = val
+
+            # 3. Log confusion matrix
+            wandb.log({
+                "test/confusion_matrix": wandb.plot.confusion_matrix(
+                    probs=None,
+                    y_true=labels,
+                    preds=preds,
+                    class_names=[ID2LABEL[i] for i in range(NUM_CLASSES)]
+                ),
+                "test/confusion_matrix_image": wandb.Image(cm_path)
+            })
+            print("WandB logging complete.")
+    except Exception as e:
+        print(f"[WARN] Failed to log extra metrics to WandB: {e}")
 
     # ── Training curves JSON (for plotting) ───────────────────────────────────
     # Extract one entry per epoch with train_loss, val_loss, train_acc, val_acc.
