@@ -6,7 +6,7 @@ BEFORE submitting the training job via sbatch.
 Also usable on Google Colab / Kaggle to download a limited subset of the dataset.
 
 It downloads:
-  1. The HuggingFace model  : facebook/timesformer-hr-finetuned-k400
+  1. The HuggingFace model  : MCG-NJU/videomae-base-finetuned-kinetics
   2. The HuggingFace dataset : endoard/distraction_detection_dataset
      (optionally limited to --videos_per_class N videos per class folder)
 
@@ -28,7 +28,7 @@ from tqdm.auto import tqdm
 from huggingface_hub import snapshot_download, hf_hub_download, HfApi
 import huggingface_hub.utils as hf_utils
 
-MODEL_REPO   = "facebook/timesformer-hr-finetuned-k400"
+MODEL_REPO   = "MCG-NJU/videomae-base-finetuned-kinetics"
 DATASET_REPO = "endoard/distraction_detection_dataset"
 
 # Classes expected in the dataset (folder names)
@@ -50,7 +50,7 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov"}
 
 
 def download_model(output_dir):
-    model_dir = os.path.join(output_dir, "timesformer-hr")
+    model_dir = os.path.join(output_dir, "videomae-base")
     os.makedirs(model_dir, exist_ok=True)
     print(f"\n[1/2] Downloading model '{MODEL_REPO}' -> {model_dir}")
     snapshot_download(
@@ -213,7 +213,7 @@ def main():
     print("=" * 60)
     print(f'  export MODEL_PATH="{model_dir}"')
     print(f'  export DATASET_PATH="{dataset_dir}"')
-    print(f'  export OUTPUT_DIR="{os.path.join(output_dir, "outputs/timesformer-hr-16")}"')
+    print(f'  export OUTPUT_DIR="{os.path.join(output_dir, "outputs/videomae-base-16")}"')
     print("=" * 60)
 
 

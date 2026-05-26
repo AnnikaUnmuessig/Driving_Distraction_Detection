@@ -60,10 +60,10 @@ class CustomLoggingCallback(TrainerCallback):
         if "loss"          in metrics: parts.append(f"loss={metrics['loss']:.4f}")
         if "eval_loss"     in metrics: parts.append(f"eval_loss={metrics['eval_loss']:.4f}")
         if "eval_accuracy" in metrics: parts.append(f"acc={metrics['eval_accuracy']:.4f}")
-        print(f"  ✓ Epoca {epoch_num}/{int(args.num_train_epochs)} completata  |  {' | '.join(parts)}")
+        print(f"  [OK] Epoca {epoch_num}/{int(args.num_train_epochs)} completata  |  {' | '.join(parts)}")
 
     def on_save(self, args, state, control, **kwargs):
-        print(f"  💾 Checkpoint salvato allo step {state.global_step}.")
+        print(f"  [SAVE] Checkpoint salvato allo step {state.global_step}.")
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         pass   # Trainer's tqdm already shows per-step info
@@ -90,7 +90,7 @@ class CheckpointCleanupCallback(TrainerCallback):
         # Keep only the last one (the one just saved)
         for old_ckpt in ckpt_dirs[:-1]:
             shutil.rmtree(old_ckpt, ignore_errors=True)
-            print(f"  🗑  Removed stale checkpoint: {os.path.basename(old_ckpt)}")
+            print(f"  [CLEAN] Removed stale checkpoint: {os.path.basename(old_ckpt)}")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 

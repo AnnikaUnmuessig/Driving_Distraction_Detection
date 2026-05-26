@@ -8,3 +8,8 @@ scikit-learn
 huggingface_hub
 matplotlib
 seaborn
+pandas
+tqdm
+peft
+accelerate
+bitsandbytes

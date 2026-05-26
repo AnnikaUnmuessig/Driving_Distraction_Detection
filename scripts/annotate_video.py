@@ -4,7 +4,7 @@ annotate_video.py
 Run sliding-window inference on a video and produce an annotated copy
 with the predicted distraction class overlaid on every frame.
 
-Supports both TimeSformer and VideoMAE checkpoints via --model_class.
+Supports VideoMAE checkpoints via --model_class.
 
 How it works
 ------------
@@ -15,17 +15,12 @@ frame of that segment. The annotated frames are written to `OUTPUT_PATH`.
 
 Usage (command line)
 --------------------
-    python annotate_video.py \\
-        --model_class timesformer \\
-        --model_dir   ./timesformer_outputs/best_model \\
-        --input       ./my_video.mp4 \\
-        --output      ./annotated.mp4 \\
+    python annotate_video.py \
+        --model_class videomae \
+        --model_dir   ./videomae_outputs/best_model \
+        --input       ./my_video.mp4 \
+        --output      ./annotated.mp4 \
         --interval    1.0
-
-    python annotate_video.py \\
-        --model_class videomae \\
-        --model_dir   ./videomae_outputs/best_model \\
-        --input       ./my_video.mp4
 
 Usage (from a notebook cell)
 -----------------------------
@@ -40,8 +35,6 @@ import cv2
 import numpy as np
 import torch
 from transformers import (
-    AutoImageProcessor,
-    TimesformerForVideoClassification,
     VideoMAEImageProcessor,
     VideoMAEForVideoClassification,
 )
@@ -49,15 +42,15 @@ import torch.nn.functional as F
 from PIL import Image
 
 # ── Default parameters (overridden by CLI args) ────────────────────────────────
-DEFAULT_MODEL_CLASS = 'timesformer'   # 'timesformer' or 'videomae'
-DEFAULT_MODEL_DIR   = './timesformer_outputs/best_model'
+DEFAULT_MODEL_CLASS = 'videomae'      # 'videomae'
+DEFAULT_MODEL_DIR   = './videomae_outputs/best_model'
 DEFAULT_INPUT       = ''              # path to input video
-DEFAULT_OUTPUT      = ''              # path for annotated output ('' → auto-named)
+DEFAULT_OUTPUT      = ''              # path for annotated output ('' -> auto-named)
 DEFAULT_INTERVAL    = 1.0             # seconds between predictions
 DEFAULT_NUM_FRAMES  = 16              # frames sampled per segment (must match training)
+DEFAULT_EMA_ALPHA   = 1.0             # 1.0 = no smoothing (disabled), < 1.0 = EMA smoothing (e.g. 0.3)
 
 _FALLBACK = {
-    'timesformer': 'facebook/timesformer-hr-finetuned-k400',
     'videomae':    'MCG-NJU/videomae-base-finetuned-kinetics',
 }
 
@@ -71,14 +64,14 @@ FONT_THICKNESS  = 2
 FONT            = cv2.FONT_HERSHEY_DUPLEX
 
 
-def load_model(model_dir: str, model_class: str = 'timesformer'):
-    """Load processor and fine-tuned model (TimeSformer or VideoMAE).
+def load_model(model_dir: str, model_class: str = 'videomae'):
+    """Load processor and fine-tuned model (VideoMAE).
 
     Falls back to HF Hub for the processor if preprocessor_config.json is absent.
     """
     model_class = model_class.lower()
-    if model_class not in _FALLBACK:
-        raise ValueError(f"model_class must be 'timesformer' or 'videomae', got '{model_class}'")
+    if model_class != 'videomae':
+        raise ValueError(f"model_class must be 'videomae', got '{model_class}'")
 
     fallback_id = _FALLBACK[model_class]
     proc_cfg    = os.path.join(model_dir, 'preprocessor_config.json')
@@ -88,21 +81,17 @@ def load_model(model_dir: str, model_class: str = 'timesformer'):
     _right = os.path.join(model_dir, 'model.safetensors')
     if os.path.isfile(_wrong) and not os.path.isfile(_right):
         import shutil; shutil.copy2(_wrong, _right)
-        print(f'[INFO] Renamed model.safetensor → model.safetensors')
+        print(f'[INFO] Renamed model.safetensor -> model.safetensors')
 
-    if model_class == 'videomae':
-        ProcessorCls = VideoMAEImageProcessor
-        ModelCls     = VideoMAEForVideoClassification
-    else:
-        ProcessorCls = AutoImageProcessor
-        ModelCls     = TimesformerForVideoClassification
+    ProcessorCls = VideoMAEImageProcessor
+    ModelCls     = VideoMAEForVideoClassification
 
     if os.path.isfile(proc_cfg):
         processor = ProcessorCls.from_pretrained(model_dir)
         print(f'[INFO] Processor loaded from local checkpoint.')
     else:
         processor = ProcessorCls.from_pretrained(fallback_id)
-        print(f'[INFO] preprocessor_config.json not found — processor loaded from HF Hub ({fallback_id}).')
+        print(f'[INFO] preprocessor_config.json not found - processor loaded from HF Hub ({fallback_id}).')
 
     model  = ModelCls.from_pretrained(model_dir, local_files_only=True)
     model.eval()
@@ -126,8 +115,22 @@ def sample_frames(pil_frames: list, num_frames: int) -> list:
 
 
 @torch.no_grad()
-def infer_segment(pil_frames: list, processor, model, device, num_frames: int):
-    """Run inference on a list of PIL frames. Returns (label, confidence, top3)."""
+def infer_segment(
+    pil_frames: list,
+    processor,
+    model,
+    device,
+    num_frames: int,
+    prev_probs: list = None,
+    ema_alpha: float = 1.0,
+):
+    """Run inference on a list of PIL frames.
+    
+    If prev_probs is provided and ema_alpha < 1.0, applies Exponential Moving Average (EMA)
+    smoothing on the predicted class probabilities.
+    
+    Returns (label, confidence, top3, probs).
+    """
     sampled = sample_frames(pil_frames, num_frames)
     inputs  = processor(images=sampled, return_tensors='pt')
     inputs  = {k: v.to(device) for k, v in inputs.items()}
@@ -135,11 +138,14 @@ def infer_segment(pil_frames: list, processor, model, device, num_frames: int):
     logits = model(**inputs).logits                   # (1, num_classes)
     probs  = F.softmax(logits, dim=-1).squeeze(0).cpu().tolist()
 
+    if prev_probs is not None and ema_alpha < 1.0:
+        probs = [ema_alpha * p + (1.0 - ema_alpha) * pp for p, pp in zip(probs, prev_probs)]
+
     id2label    = model.config.id2label
     top_indices = sorted(range(len(probs)), key=lambda i: probs[i], reverse=True)
     best_id     = top_indices[0]
     top3        = [(id2label[i], round(probs[i], 3)) for i in top_indices[:3]]
-    return id2label[best_id], round(probs[best_id], 3), top3
+    return id2label[best_id], round(probs[best_id], 3), top3, probs
 
 
 def draw_overlay(frame_bgr: np.ndarray, label: str, confidence: float, top3: list) -> np.ndarray:
@@ -185,7 +191,8 @@ def annotate_video(
     output_path: str = '',
     interval_sec: float = 1.0,
     num_frames: int = 16,
-    model_class: str = 'timesformer',
+    model_class: str = 'videomae',
+    ema_alpha: float = 1.0,
 ):
     """
     Annotate a video with sliding-window distraction predictions.
@@ -197,7 +204,8 @@ def annotate_video(
     output_path  : Where to save the annotated video. Auto-named if empty.
     interval_sec : Seconds between prediction updates (default: 1.0).
     num_frames   : Frames sampled per segment for inference (default: 16).
-    model_class  : 'timesformer' or 'videomae' (default: 'timesformer').
+    model_class  : 'videomae' (default: 'videomae').
+    ema_alpha    : Smoothing factor for Exponential Moving Average (default: 1.0, i.e. no smoothing).
 
     Returns
     -------
@@ -209,7 +217,7 @@ def annotate_video(
 
     print(f'[INFO] Input  : {input_path}')
     print(f'[INFO] Output : {output_path}')
-    print(f'[INFO] Model  : {model_class} | Interval: {interval_sec}s | Frames/segment: {num_frames}')
+    print(f'[INFO] Model  : {model_class} | Interval: {interval_sec}s | Frames/segment: {num_frames} | EMA Alpha: {ema_alpha}')
 
     # ── Load model ────────────────────────────────────────────────────────────
     processor, model, device = load_model(model_dir, model_class)
@@ -237,6 +245,7 @@ def annotate_video(
     current_label = 'Initializing...'
     current_conf  = 0.0
     current_top3  = []
+    prev_probs    = None
 
     while True:
         raw_frames = []
@@ -257,8 +266,8 @@ def annotate_video(
         print(f'  Segment {seg_idx:4d}/{total_segs}  ({len(raw_frames)} frames) ', end='', flush=True)
 
         # Inference on this segment
-        current_label, current_conf, current_top3 = infer_segment(
-            pil_frames, processor, model, device, num_frames
+        current_label, current_conf, current_top3, prev_probs = infer_segment(
+            pil_frames, processor, model, device, num_frames, prev_probs, ema_alpha
         )
         print(f'→ {current_label} ({current_conf*100:.1f}%)')
 
@@ -278,7 +287,7 @@ def annotate_video(
 def parse_args():
     p = argparse.ArgumentParser(description='Annotate a video with distraction predictions.')
     p.add_argument('--model_class', default=DEFAULT_MODEL_CLASS,
-                   choices=['timesformer', 'videomae'],
+                   choices=['videomae'],
                    help='Model architecture (default: %(default)s).')
     p.add_argument('--model_dir', default=DEFAULT_MODEL_DIR,
                    help='Path to best_model/ directory (default: %(default)s).')
@@ -290,6 +299,8 @@ def parse_args():
                    help='Seconds between prediction updates (default: %(default)s).')
     p.add_argument('--num_frames', type=int, default=DEFAULT_NUM_FRAMES,
                    help='Frames sampled per segment (default: %(default)s).')
+    p.add_argument('--ema_alpha',  type=float, default=DEFAULT_EMA_ALPHA,
+                   help='EMA alpha for smoothing predictions. 1.0 = disabled, < 1.0 = smoother (default: %(default)s).')
     return p.parse_args()
 
 
@@ -302,4 +313,5 @@ if __name__ == '__main__':
         interval_sec = args.interval,
         num_frames   = args.num_frames,
         model_class  = args.model_class,
+        ema_alpha    = args.ema_alpha,
     )

@@ -234,9 +234,9 @@ def print_report(stats: dict, csv_path: str = None):
 
     # Suggest a cap
     min_frames = min(v["frames"] for v in stats.values())
-    print(f"\n💡 Balancing insight:")
+    print(f"\n[INFO] Balancing insight:")
     print(f"   Smallest class frames : {min_frames:,}")
-    print(f"   If you cap ALL classes to {min_frames:,} frames → {min_frames * len(stats):,} total frames")
+    print(f"   If you cap ALL classes to {min_frames:,} frames -> {min_frames * len(stats):,} total frames")
 
     # Suggest clip caps
     print(f"\n   Suggested LIMIT_CAP per class (to reach ~{min_frames:,} frames each):")
@@ -251,7 +251,7 @@ def print_report(stats: dict, csv_path: str = None):
             writer = csv.DictWriter(f, fieldnames=rows[0].keys())
             writer.writeheader()
             writer.writerows(rows)
-        print(f"\n✅ Results saved to: {csv_path}")
+        print(f"\n[SUCCESS] Results saved to: {csv_path}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────

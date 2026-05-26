@@ -295,7 +295,7 @@ def main() -> None:
             fh.write("\n")
 
     print(
-        f"\n✓ Done.\n"
+        f"\n[OK] Done.\n"
         f"  Clips written to : {clips_dir}\n"
         f"  Label file       : {labels_path}\n"
         f"  Total clips      : {len(label_lines)}"
