@@ -409,7 +409,7 @@ def main():
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
-        metric_for_best_model="accuracy",
+        metric_for_best_model="eval_accuracy",
         greater_is_better=True,
         # Keep the two latest checkpoints to preserve the best one
         save_total_limit=4,
@@ -442,7 +442,6 @@ def main():
         compute_metrics=compute_metrics,
         class_weights=class_weights,
         callbacks=[
-            EarlyStoppingCallback(early_stopping_patience=5),
             CustomLoggingCallback(),
             CheckpointCleanupCallback(),
         ],
