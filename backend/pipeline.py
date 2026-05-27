@@ -110,74 +110,56 @@ def build_audio_track(alert_log, total_duration_seconds):
     """
     if not alert_log:
         return None
+
+    import tempfile
+    
     # ── DEBUG: print all alert timestamps ──
     print(f"\n[DEBUG] {len(alert_log)} alert(s) queued for mixing:")
     for i, (ts, audio_bytes) in enumerate(alert_log):
         print(f"   Alert {i+1}: timestamp={ts:.3f}s, size={len(audio_bytes):,} bytes")
 
-
-    # One anonymous OS pipe per clip — FFmpeg reads the read-end, parent writes the write-end
-    pipe_pairs = []
-    for _ in alert_log:
-        r, w = os.pipe()
-        pipe_pairs.append((r, w))
-
-    read_fds = [r for r, _ in pipe_pairs]
-
-    # Build FFmpeg command
-    cmd = ["ffmpeg", "-y"]
-    for r_fd in read_fds:
-        cmd += ["-i", f"pipe:{r_fd}"]
-
-    filter_parts = []
-    for i, (ts, _) in enumerate(alert_log):
-        delay_ms = int(ts * 1000)
-        filter_parts.append(f"[{i}:a]adelay={delay_ms}|{delay_ms}[a{i}]")
-
-    mix_inputs = "".join(f"[a{i}]" for i in range(len(alert_log)))
-    filter_parts.append(
-        f"{mix_inputs}amix=inputs={len(alert_log)}:normalize=0:dropout_transition=0[aout]"
-    )
-
-    cmd += [
-        "-filter_complex", ";".join(filter_parts),
-        "-map", "[aout]",
-        "-t", str(total_duration_seconds),  # hard trim to video length
-        "-ar", "44100",
-        "-ac", "2",
-        "-f", "s16le",                      # raw PCM — no container overhead
-        "pipe:1"
-    ]
-
+    temp_files = []
     try:
+        # 1. Write all alert audio bytes to temporary files
+        for i, (ts, audio_bytes) in enumerate(alert_log):
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.write(audio_bytes)
+            tmp.close()
+            temp_files.append(tmp.name)
+
+        # 2. Build FFmpeg command
+        cmd = ["ffmpeg", "-y"]
+        for path in temp_files:
+            cmd += ["-i", path]
+
+        filter_parts = []
+        for i, (ts, _) in enumerate(alert_log):
+            delay_ms = int(ts * 1000)
+            filter_parts.append(f"[{i}:a]adelay={delay_ms}|{delay_ms}[a{i}]")
+
+        mix_inputs = "".join(f"[a{i}]" for i in range(len(alert_log)))
+        filter_parts.append(
+            f"{mix_inputs}amix=inputs={len(alert_log)}:normalize=0:dropout_transition=0[aout]"
+        )
+
+        cmd += [
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "[aout]",
+            "-t", str(total_duration_seconds),  # hard trim to video length
+            "-ar", "44100",
+            "-ac", "2",
+            "-f", "s16le",                      # raw PCM — no container overhead
+            "pipe:1"
+        ]
+
+        # 3. Run FFmpeg
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            pass_fds=tuple(read_fds)
+            stderr=subprocess.PIPE
         )
-
-        # Write each clip into its pipe's write-end in a background thread.
-        # Must be threaded to avoid deadlocking while FFmpeg reads simultaneously.
-        def write_clip(w_fd, audio_bytes):
-            try:
-                with os.fdopen(w_fd, "wb") as f:
-                    f.write(audio_bytes)
-            except BrokenPipeError:
-                pass  # FFmpeg finished early (e.g. clip longer than -t) — that's fine
-
-        writers = []
-        for (r_fd, w_fd), (_, audio_bytes) in zip(pipe_pairs, alert_log):
-            os.close(r_fd)  # close the read-end in the parent; FFmpeg holds its copy
-            t = threading.Thread(target=write_clip, args=(w_fd, audio_bytes), daemon=True)
-            t.start()
-            writers.append(t)
-
         pcm_bytes, stderr = proc.communicate()
-
-        for t in writers:
-            t.join(timeout=5)
 
         if proc.returncode != 0:
             print(f"[ERROR] Audio mix failed:\n{stderr.decode(errors='replace')}")
@@ -188,13 +170,15 @@ def build_audio_track(alert_log, total_duration_seconds):
 
     except Exception as e:
         print(f"[ERROR] build_audio_track exception: {e}")
-        for r, w in pipe_pairs:
-            for fd in (r, w):
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
         return None
+    finally:
+        # 4. Clean up temporary files
+        for path in temp_files:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception as clean_err:
+                print(f"[WARN] Failed to clean up temp file {path}: {clean_err}")
 
 
 def _convert_to_h264(input_path, output_path):
