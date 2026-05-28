@@ -266,7 +266,7 @@ class DetectionState:
     def _trigger_alert(self, distraction_output, warning_type: str, timestamp_sec: float):
         with self.alert_lock:
             print(f"[DEBUG] _trigger_alert called, audio_playing={self.audio_playing}, last_alert_time={self.last_alert_time:.2f}, timestamp={timestamp_sec:.2f}")
-            if timestamp_sec - self.last_alert_time < 3.5:
+            if timestamp_sec - self.last_alert_time < 5:
                 print(f"[BLOCKED] Cooldown active")
                 return False
             with self.audio_playing_lock:

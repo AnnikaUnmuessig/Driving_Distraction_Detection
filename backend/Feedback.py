@@ -34,7 +34,7 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
             llm_response = groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
-                    {"role": "system", "content": "You are a car safety AI. Output a VERY short, one sentence, authoritative warning directly to the driver considering the type of distraction."},
+                    {"role": "system", "content": "You are a car safety AI. Output a VERY short, one sentence, authoritative warning directly to the driver, consider the type of distraction."},
                     {"role": "user", "content": f"The driver is {distraction_output['distraction_type']}. Give a {warning_type} warning."}
                 ],
                 stream=False
