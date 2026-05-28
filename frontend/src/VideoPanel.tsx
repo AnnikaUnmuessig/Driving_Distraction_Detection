@@ -10,7 +10,12 @@ type Props = {
   confirmedHandState?: { left: boolean; right: boolean };
   pendingCount?: number;
   debounceThreshold?: number;
-  latestVoiceAlert?: { text: string; severity: string } | null;
+  latestVoiceAlert?: {
+    text: string;
+    severity: string;
+    triggerSource?: "hands_off" | "action";
+    distractionType?: string;
+  } | null;
   children?: React.ReactNode;
 };
 
@@ -68,6 +73,16 @@ export function VideoPanel({
         {/* Floating Voice Alert Banner */}
         {latestVoiceAlert && (() => {
           const sev = SEV_COLORS[latestVoiceAlert.severity] || { fg: "#c084fc", dot: "#a78bfa" };
+          const reasonLabel =
+            latestVoiceAlert.triggerSource === "hands_off"
+              ? "hands off wheel"
+              : latestVoiceAlert.triggerSource === "action"
+                ? "action"
+                : undefined;
+          const actionLabel =
+            latestVoiceAlert.triggerSource === "action" && latestVoiceAlert.distractionType
+              ? latestVoiceAlert.distractionType.replaceAll("_", " ")
+              : undefined;
           return (
             <div style={{
               position: "absolute",
@@ -96,8 +111,21 @@ export function VideoPanel({
                   letterSpacing: "0.08em",
                   textTransform: "uppercase"
                 }}>
-                  AI Voice Alert ({latestVoiceAlert.severity})
+                  AI Voice Alert ({latestVoiceAlert.severity}{reasonLabel ? ` • ${reasonLabel}` : ""})
                 </div>
+                {actionLabel && (
+                  <div style={{
+                    fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: 9,
+                    fontWeight: 600,
+                    color: "rgba(255,255,255,0.65)",
+                    letterSpacing: "0.06em",
+                    marginTop: 3,
+                    textTransform: "uppercase",
+                  }}>
+                    ACTION: {actionLabel}
+                  </div>
+                )}
                 <div style={{
                   fontFamily: "inherit",
                   fontSize: 11,
@@ -148,6 +176,12 @@ export function VideoPanel({
         ) : alerts.map((a, i) => {
           const isText = a.type === "alert_text";
           const sev = SEV_COLORS[a.severity ?? ""] ?? { bg: "rgba(255,255,255,0.05)", fg: "#aaa", dot: "#888" };
+          const reasonLabel =
+            a.trigger_source === "hands_off"
+              ? "hands off"
+              : a.trigger_source === "action"
+                ? "action"
+                : undefined;
           return (
             <div key={i} style={{ display: "flex", alignItems: "center", gap: 6,
               padding: "4px 8px", borderRadius: 4,
@@ -168,7 +202,7 @@ export function VideoPanel({
                 {isText ? `"${a.text}"` : (a.distraction_type ?? a.message ?? "event")}
               </span>
               <span style={{ color: "rgba(255,255,255,0.25)", fontSize: 9 }}>
-                {isText ? "voice alert" : (a.severity ?? "alert")}
+                {isText ? `voice${reasonLabel ? ` • ${reasonLabel}` : ""}` : `${a.severity ?? "alert"}${reasonLabel ? ` • ${reasonLabel}` : ""}`}
               </span>
             </div>
           );

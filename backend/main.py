@@ -11,6 +11,7 @@ Exposes:
 from huggingface_hub.inference._generated.types import zero_shot_image_classification
 from huggingface_hub.inference._generated.types import zero_shot_image_classification
 from huggingface_hub.inference._generated.types import zero_shot_image_classification
+from huggingface_hub.inference._generated.types import zero_shot_image_classification
 import asyncio
 import json
 import os
@@ -100,6 +101,7 @@ class DetectionState:
         self.last_action_time_sec: float = 0.0
         self.action_interval_sec: float = 1.0
         self.last_processed_result_id: int = -1
+        self.latest_action_result_time_sec: float = 0.0
         self.last_alert_time: float = 0.0
         self.last_detection_result: Optional[dict] = None
         self.confirmed_hand_state: dict = {"left": True, "right": True}
@@ -135,8 +137,10 @@ class DetectionState:
             except queue.Empty:
                 break
 
-        # Use video timeline time for file uploads and wall-clock time for live webcam
         time_sec = cap_msec / 1000.0 if not self.play_audio else current_time
+
+        action_alert_fired = False  # track if action fired this frame
+        hand_alert_pending = None   # store hand alert to fire later
 
         # -- Mediapipe: steering wheel + hand detection --
         if self.mediapipe_enabled:
@@ -145,7 +149,6 @@ class DetectionState:
                 run_roboflow = True
                 self.last_roboflow_time = time_sec
 
-            # Run MediaPipe on every frame, passing the cached box if Roboflow is skipped
             result = detect_steering_and_hands(frame, steering_box=None if run_roboflow else self.cached_steering_box)
 
             if run_roboflow:
@@ -195,27 +198,17 @@ class DetectionState:
                 left_off  = not self.confirmed_hand_state["left"]
                 right_off = not self.confirmed_hand_state["right"]
 
+                # Store hand alert as pending — don't fire yet
                 if off_duration >= HANDS_OFF_THRESHOLD and left_off != right_off:
-                    # One hand off wheel
-                    fired = self._trigger_alert(
+                    hand_alert_pending = (
                         {"distracted": "yes", "distraction_type": "one hand off wheel"},
-                        warning_type="light",
-                        timestamp_sec=time_sec,
+                        "light"
                     )
-                    if fired:
-                        self.hands_off_since = time_sec
-                        events.append({"type": "alert", "distraction_type": "one hand off wheel", "severity": "light"})
-
                 elif off_duration >= HANDS_OFF_THRESHOLD and left_off and right_off:
-                    # Both hands off wheel
-                    fired = self._trigger_alert(
+                    hand_alert_pending = (
                         {"distracted": "yes", "distraction_type": "both hands off wheel"},
-                        warning_type="heavy",
-                        timestamp_sec=time_sec,
+                        "heavy"
                     )
-                    if fired:
-                        self.hands_off_since = time_sec
-                        events.append({"type": "alert", "distraction_type": "both hands off wheel", "severity": "heavy"})
 
         # -- VideoMAE: action classification --
         if self.videomae_enabled:
@@ -224,46 +217,100 @@ class DetectionState:
             while len(self.frames_buffer) > max_buffer_size:
                 self.frames_buffer.pop(0)
 
-            # Queue frames at the configured action_interval_sec rate
             if (
                 len(self.frames_buffer) >= 16
                 and time_sec - self.last_action_time_sec >= self.action_interval_sec
             ):
                 self.last_action_time_sec = time_sec
-                # Sample 16 frames uniformly
                 n = len(self.frames_buffer)
                 indices = np.linspace(0, n - 1, 16, dtype=int)
                 sampled_frames = [self.frames_buffer[i] for i in indices]
                 self.action_worker.queue_frames(sampled_frames)
 
-            # Read latest prediction result (polled on every single frame)
             result = self.action_worker.get_result()
             if result:
                 result_id = result.get("result_id", 0)
                 if result_id > self.last_processed_result_id:
                     self.last_processed_result_id = result_id
                     self.latest_action_result = result
-                    
+                    self.latest_action_result_time_sec = time_sec
+
                     if result.get("confidence", 0) > ACTION_CONFIDENCE_THRESHOLD:
                         action = result["predicted_class"]
                         warning_type = get_action_warning_type(action)
 
-                        if warning_type is None:  # safe_driving or change_gear — no alert
+                        if warning_type is None:
                             print(f"[OK] Safe action detected: '{action}' — no alert.")
                         else:
                             fired = self._trigger_alert(
                                 {"distracted": "yes", "distraction_type": action},
                                 warning_type=warning_type,
                                 timestamp_sec=time_sec,
+                                trigger_source="action",
                             )
                             if fired:
-                                events.append({"type": "alert", "distraction_type": action, "severity": warning_type})
+                                action_alert_fired = True  # mark action as fired
+                                events.append({
+                                    "type": "alert",
+                                    "distraction_type": action,
+                                    "severity": warning_type,
+                                    "trigger_source": "action",
+                                })
 
-        self.frame_count += 1
+        # -- Fire hand alert only if action didn't fire this frame AND no action alert is currently playing --
+        if hand_alert_pending and not action_alert_fired:
+            with self.audio_playing_lock:
+                audio_busy = self.audio_playing
+            if not audio_busy:
+                # Action priority: right before firing hands-off, re-check the most recent
+                # action model output and try to fire an action alert first if applicable.
+                ar = self.latest_action_result
+                if ar and (time_sec - self.latest_action_result_time_sec) <= max(0.25, self.action_interval_sec * 1.25):
+                    if ar.get("confidence", 0) > ACTION_CONFIDENCE_THRESHOLD:
+                        action = ar.get("predicted_class")
+                        if action:
+                            warning_type = get_action_warning_type(action)
+                            if warning_type is not None:
+                                fired = self._trigger_alert(
+                                    {"distracted": "yes", "distraction_type": action},
+                                    warning_type=warning_type,
+                                    timestamp_sec=time_sec,
+                                    trigger_source="action",
+                                )
+                                if fired:
+                                    action_alert_fired = True
+                                    events.append({
+                                        "type": "alert",
+                                        "distraction_type": action,
+                                        "severity": warning_type,
+                                        "trigger_source": "action",
+                                    })
+
+                # If action didn’t fire, fall back to hands-off alert.
+                if action_alert_fired:
+                    self.frame_count += 1
+                    output_frame = self._annotate(frame, w, h)
+                    return {"frame": output_frame, "events": events}
+                distraction_output, warning_type = hand_alert_pending
+                fired = self._trigger_alert(
+                    distraction_output,
+                    warning_type=warning_type,
+                    timestamp_sec=time_sec,
+                    trigger_source="hands_off",
+                )
+                if fired:
+                    self.hands_off_since = time_sec
+                    events.append({
+                        "type": "alert",
+                        "distraction_type": distraction_output["distraction_type"],
+                        "severity": warning_type,
+                        "trigger_source": "hands_off",
+                    })
+            self.frame_count += 1
         output_frame = self._annotate(frame, w, h)
         return {"frame": output_frame, "events": events}
 
-    def _trigger_alert(self, distraction_output, warning_type: str, timestamp_sec: float):
+    def _trigger_alert(self, distraction_output, warning_type: str, timestamp_sec: float, trigger_source: str):
         with self.alert_lock:
             print(f"[DEBUG] _trigger_alert called, audio_playing={self.audio_playing}, last_alert_time={self.last_alert_time:.2f}, timestamp={timestamp_sec:.2f}")
             if timestamp_sec - self.last_alert_time < 5:
@@ -280,12 +327,12 @@ class DetectionState:
         print(f"[DEBUG] Spawning alert thread")
         threading.Thread(
             target=self._fire_alert,
-            args=(distraction_output, warning_type, timestamp_sec, self.play_audio),
+            args=(distraction_output, warning_type, timestamp_sec, self.play_audio, trigger_source),
             daemon=False
         ).start()
         return True
 
-    def _fire_alert(self, distraction_output, warning_type: str, video_timestamp, play_audio):
+    def _fire_alert(self, distraction_output, warning_type: str, video_timestamp, play_audio, trigger_source: str):
         try:
             audio_bytes, warning_text = generate_safety_alert_all_groq(
                 distraction_output, warning_type=warning_type, play_audio=play_audio
@@ -299,6 +346,7 @@ class DetectionState:
                     "text": warning_text,
                     "distraction_type": distraction_output.get("distraction_type"),
                     "severity": warning_type,
+                    "trigger_source": trigger_source,
                 })
         except Exception as e:
             print(f"Alert error: {e}")

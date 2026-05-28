@@ -4,6 +4,7 @@ export type AlertEvent = {
   type: "alert" | "done" | "error" | "hand_state" | "alert_text";
   distraction_type?: string;
   severity?: string;
+  trigger_source?: "hands_off" | "action";
   message?: string;
   text?: string;
   confirmed?: { left: boolean; right: boolean };
@@ -22,7 +23,12 @@ export function useVideoStream(url: string | null) {
     pendingCount: 0
   });
   const prevBlobUrl = useRef<string | null>(null);
-  const [latestVoiceAlert, setLatestVoiceAlert] = useState<{ text: string; severity: string } | null>(null);
+  const [latestVoiceAlert, setLatestVoiceAlert] = useState<{
+    text: string;
+    severity: string;
+    triggerSource?: "hands_off" | "action";
+    distractionType?: string;
+  } | null>(null);
   const voiceAlertTimeoutRef = useRef<any>(null);
 
   const connect = useCallback(() => {
@@ -50,7 +56,9 @@ export function useVideoStream(url: string | null) {
         } else if (event.type === "alert_text") {
           setLatestVoiceAlert({
             text: event.text || "",
-            severity: event.severity || "light"
+            severity: event.severity || "light",
+            triggerSource: event.trigger_source,
+            distractionType: event.distraction_type,
           });
           setAlerts((prev) => [event, ...prev].slice(0, 50));
           
