@@ -28,6 +28,14 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
     warning_text = None
     raw_audio_bytes = None
 
+    action_map = {
+        "drinking": "drinking from a bottle",
+        "radio": "operating radio buttons",
+        "hair_and_makeup": "fixing hair or applying makeup",
+    }
+    dtype_raw = distraction_output.get("distraction_type", "distraction")
+    dtype_for_llm = action_map.get(dtype_raw, dtype_raw)
+
     # 1. Groq LLM (text only)
     if groq_client:
         try:
@@ -35,7 +43,7 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
                 model="llama-3.1-8b-instant",
                 messages=[
                     {"role": "system", "content": "You are a car safety AI. Output a VERY short, one sentence, authoritative warning directly to the driver, consider the type of distraction."},
-                    {"role": "user", "content": f"The driver is {distraction_output['distraction_type']}. Give a {warning_type} warning."}
+                    {"role": "user", "content": f"The driver is {dtype_for_llm}. Give a {warning_type} warning."}
                 ],
                 stream=False
             )

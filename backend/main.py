@@ -116,6 +116,12 @@ class DetectionState:
         self.audio_playing = False
         self.audio_playing_lock = threading.Lock()
 
+        # Action persistence: only warn if the same warning-worthy action persists.
+        self.action_persist_sec: float = 4.0
+        self.action_candidate: Optional[str] = None
+        self.action_candidate_since_sec: Optional[float] = None
+        self.action_candidate_last_seen_sec: Optional[float] = None
+
         # Toggle flags (controllable from frontend)
         self.mediapipe_enabled: bool = True
         self.videomae_enabled: bool = True
@@ -125,6 +131,47 @@ class DetectionState:
         # Action recognition worker
         self.action_worker = ActionRecognitionWorker()
         self.action_worker.start()
+
+    def _action_candidate_stale(self, now_sec: float) -> bool:
+        last = self.action_candidate_last_seen_sec
+        if last is None:
+            return True
+        # Allow slack so we don't reset between model updates.
+        return (now_sec - last) > max(1.5, self.action_interval_sec * 2.5)
+
+    def _update_action_candidate_from_result(self, action: Optional[str], confidence: float, now_sec: float) -> None:
+        if not action or confidence <= ACTION_CONFIDENCE_THRESHOLD:
+            self.action_candidate = None
+            self.action_candidate_since_sec = None
+            self.action_candidate_last_seen_sec = None
+            return
+
+        # Only persist "warning-worthy" actions; safe_driving and other safe actions don't count.
+        if get_action_warning_type(action) is None:
+            self.action_candidate = None
+            self.action_candidate_since_sec = None
+            self.action_candidate_last_seen_sec = None
+            return
+
+        if self.action_candidate != action:
+            self.action_candidate = action
+            self.action_candidate_since_sec = now_sec
+            self.action_candidate_last_seen_sec = now_sec
+            return
+
+        self.action_candidate_last_seen_sec = now_sec
+
+    def _get_persisted_action(self, now_sec: float) -> Optional[str]:
+        if not self.action_candidate or self.action_candidate_since_sec is None:
+            return None
+        if self._action_candidate_stale(now_sec):
+            self.action_candidate = None
+            self.action_candidate_since_sec = None
+            self.action_candidate_last_seen_sec = None
+            return None
+        if (now_sec - self.action_candidate_since_sec) >= self.action_persist_sec:
+            return self.action_candidate
+        return None
 
     def process_frame(self, frame: np.ndarray, current_time: float, cap_msec: float):
         h, w = frame.shape[:2]
@@ -235,15 +282,16 @@ class DetectionState:
                     self.latest_action_result = result
                     self.latest_action_result_time_sec = time_sec
 
-                    if result.get("confidence", 0) > ACTION_CONFIDENCE_THRESHOLD:
-                        action = result["predicted_class"]
-                        warning_type = get_action_warning_type(action)
+                    action = result.get("predicted_class")
+                    confidence = float(result.get("confidence", 0) or 0)
+                    self._update_action_candidate_from_result(action, confidence, time_sec)
 
-                        if warning_type is None:
-                            print(f"[OK] Safe action detected: '{action}' — no alert.")
-                        else:
+                    persisted_action = self._get_persisted_action(time_sec)
+                    if persisted_action:
+                        warning_type = get_action_warning_type(persisted_action)
+                        if warning_type is not None:
                             fired = self._trigger_alert(
-                                {"distracted": "yes", "distraction_type": action},
+                                {"distracted": "yes", "distraction_type": persisted_action},
                                 warning_type=warning_type,
                                 timestamp_sec=time_sec,
                                 trigger_source="action",
@@ -252,7 +300,7 @@ class DetectionState:
                                 action_alert_fired = True  # mark action as fired
                                 events.append({
                                     "type": "alert",
-                                    "distraction_type": action,
+                                    "distraction_type": persisted_action,
                                     "severity": warning_type,
                                     "trigger_source": "action",
                                 })
@@ -262,32 +310,38 @@ class DetectionState:
             with self.audio_playing_lock:
                 audio_busy = self.audio_playing
             if not audio_busy:
-                # Action priority: right before firing hands-off, re-check the most recent
-                # action model output and try to fire an action alert first if applicable.
+                # If hands are off wheel:
+                # - If current action == safe_driving -> warn hands-off
+                # - Else -> only warn once a warning-worthy action persists for action_persist_sec seconds
                 ar = self.latest_action_result
-                if ar and (time_sec - self.latest_action_result_time_sec) <= max(0.25, self.action_interval_sec * 1.25):
-                    if ar.get("confidence", 0) > ACTION_CONFIDENCE_THRESHOLD:
-                        action = ar.get("predicted_class")
-                        if action:
-                            warning_type = get_action_warning_type(action)
-                            if warning_type is not None:
-                                fired = self._trigger_alert(
-                                    {"distracted": "yes", "distraction_type": action},
-                                    warning_type=warning_type,
-                                    timestamp_sec=time_sec,
-                                    trigger_source="action",
-                                )
-                                if fired:
-                                    action_alert_fired = True
-                                    events.append({
-                                        "type": "alert",
-                                        "distraction_type": action,
-                                        "severity": warning_type,
-                                        "trigger_source": "action",
-                                    })
+                recent_action = (
+                    ar is not None
+                    and (time_sec - self.latest_action_result_time_sec)
+                    <= max(0.25, self.action_interval_sec * 1.25)
+                )
+                current_action = ar.get("predicted_class") if (ar and recent_action) else None
 
-                # If action didn’t fire, fall back to hands-off alert.
-                if action_alert_fired:
+                if current_action and current_action != "safe_driving":
+                    persisted_action = self._get_persisted_action(time_sec)
+                    if persisted_action:
+                        warning_type = get_action_warning_type(persisted_action)
+                        if warning_type is not None:
+                            fired = self._trigger_alert(
+                                {"distracted": "yes", "distraction_type": persisted_action},
+                                warning_type=warning_type,
+                                timestamp_sec=time_sec,
+                                trigger_source="action",
+                            )
+                            if fired:
+                                action_alert_fired = True
+                                events.append({
+                                    "type": "alert",
+                                    "distraction_type": persisted_action,
+                                    "severity": warning_type,
+                                    "trigger_source": "action",
+                                })
+
+                    # Do not fall back to hands-off while a non-safe action is present.
                     self.frame_count += 1
                     output_frame = self._annotate(frame, w, h)
                     return {"frame": output_frame, "events": events}
