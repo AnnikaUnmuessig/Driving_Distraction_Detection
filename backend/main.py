@@ -8,6 +8,9 @@ Exposes:
   GET  /output/{job_id}             — download the _final.mp4 once ready
 """
 
+from huggingface_hub.inference._generated.types import zero_shot_image_classification
+from huggingface_hub.inference._generated.types import zero_shot_image_classification
+from huggingface_hub.inference._generated.types import zero_shot_image_classification
 import asyncio
 import json
 import os
@@ -39,6 +42,7 @@ from pipeline import (
     VIDEOMAE_WINDOW_SIZE,
     WHEEL_DETECTION_INTERVAL,
     ACTION_CONFIDENCE_THRESHOLD,
+    get_action_warning_type,
 )
 
 UPLOAD_DIR = Path("uploads")
@@ -106,6 +110,9 @@ class DetectionState:
         self.alert_log: list = []
         self.alert_log_lock = threading.Lock()
         self.latest_action_result: Optional[dict] = None
+        self.async_events = queue.Queue()
+        self.audio_playing = False
+        self.audio_playing_lock = threading.Lock()
 
         # Toggle flags (controllable from frontend)
         self.mediapipe_enabled: bool = True
@@ -120,6 +127,13 @@ class DetectionState:
     def process_frame(self, frame: np.ndarray, current_time: float, cap_msec: float):
         h, w = frame.shape[:2]
         events = []
+
+        # Drain async events queue
+        while not self.async_events.empty():
+            try:
+                events.append(self.async_events.get_nowait())
+            except queue.Empty:
+                break
 
         # Use video timeline time for file uploads and wall-clock time for live webcam
         time_sec = cap_msec / 1000.0 if not self.play_audio else current_time
@@ -178,14 +192,30 @@ class DetectionState:
                 if self.hands_off_since is None:
                     self.hands_off_since = time_sec
                 off_duration = time_sec - self.hands_off_since
-                if off_duration >= HANDS_OFF_THRESHOLD:
+                left_off  = not self.confirmed_hand_state["left"]
+                right_off = not self.confirmed_hand_state["right"]
+
+                if off_duration >= HANDS_OFF_THRESHOLD and left_off != right_off:
+                    # One hand off wheel
                     fired = self._trigger_alert(
-                        {"distracted": "yes", "distraction_type": "hands off wheel", "type of warning": "mid-heavy"},
-                        time_sec,
+                        {"distracted": "yes", "distraction_type": "one hand off wheel"},
+                        warning_type="light",
+                        timestamp_sec=time_sec,
                     )
                     if fired:
                         self.hands_off_since = time_sec
-                        events.append({"type": "alert", "distraction_type": "hands off wheel", "severity": "mid-heavy"})
+                        events.append({"type": "alert", "distraction_type": "one hand off wheel", "severity": "light"})
+
+                elif off_duration >= HANDS_OFF_THRESHOLD and left_off and right_off:
+                    # Both hands off wheel
+                    fired = self._trigger_alert(
+                        {"distracted": "yes", "distraction_type": "both hands off wheel"},
+                        warning_type="heavy",
+                        timestamp_sec=time_sec,
+                    )
+                    if fired:
+                        self.hands_off_since = time_sec
+                        events.append({"type": "alert", "distraction_type": "both hands off wheel", "severity": "heavy"})
 
         # -- VideoMAE: action classification --
         if self.videomae_enabled:
@@ -216,41 +246,66 @@ class DetectionState:
                     
                     if result.get("confidence", 0) > ACTION_CONFIDENCE_THRESHOLD:
                         action = result["predicted_class"]
-                        fired = self._trigger_alert(
-                            {"distracted": "yes", "distraction_type": action, "type of warning": "light-mid"},
-                            time_sec,
-                        )
-                        if fired:
-                            events.append({"type": "alert", "distraction_type": action, "severity": "light-mid"})
+                        warning_type = get_action_warning_type(action)
+
+                        if warning_type is None:  # safe_driving or change_gear — no alert
+                            print(f"[OK] Safe action detected: '{action}' — no alert.")
+                        else:
+                            fired = self._trigger_alert(
+                                {"distracted": "yes", "distraction_type": action},
+                                warning_type=warning_type,
+                                timestamp_sec=time_sec,
+                            )
+                            if fired:
+                                events.append({"type": "alert", "distraction_type": action, "severity": warning_type})
 
         self.frame_count += 1
         output_frame = self._annotate(frame, w, h)
         return {"frame": output_frame, "events": events}
 
-    def _trigger_alert(self, distraction_output, timestamp_sec):
-        # Cooldown of 3.5 seconds in video timeline time (or wall-clock time for webcam)
+    def _trigger_alert(self, distraction_output, warning_type: str, timestamp_sec: float):
         with self.alert_lock:
+            print(f"[DEBUG] _trigger_alert called, audio_playing={self.audio_playing}, last_alert_time={self.last_alert_time:.2f}, timestamp={timestamp_sec:.2f}")
             if timestamp_sec - self.last_alert_time < 3.5:
+                print(f"[BLOCKED] Cooldown active")
                 return False
+            with self.audio_playing_lock:
+                if self.audio_playing:
+                    print("[BLOCKED] Audio still playing")
+                    return False
+                self.audio_playing = True
             self.last_alert_time = timestamp_sec
             self.active_alert_threads += 1
 
+        print(f"[DEBUG] Spawning alert thread")
         threading.Thread(
             target=self._fire_alert,
-            args=(distraction_output, timestamp_sec, self.play_audio),
-            daemon=True
+            args=(distraction_output, warning_type, timestamp_sec, self.play_audio),
+            daemon=False
         ).start()
         return True
 
-    def _fire_alert(self, distraction_output, video_timestamp, play_audio):
+    def _fire_alert(self, distraction_output, warning_type: str, video_timestamp, play_audio):
         try:
-            audio_bytes = generate_safety_alert_all_groq(distraction_output, play_audio=play_audio)
+            audio_bytes, warning_text = generate_safety_alert_all_groq(
+                distraction_output, warning_type=warning_type, play_audio=play_audio
+            )
             if isinstance(audio_bytes, bytes) and audio_bytes:
                 with self.alert_log_lock:
                     self.alert_log.append((video_timestamp, audio_bytes))
+            if warning_text:
+                self.async_events.put({
+                    "type": "alert_text",
+                    "text": warning_text,
+                    "distraction_type": distraction_output.get("distraction_type"),
+                    "severity": warning_type,
+                })
         except Exception as e:
             print(f"Alert error: {e}")
         finally:
+            # Clear playing flag so next alert can fire
+            with self.audio_playing_lock:
+                self.audio_playing = False
             with self.alert_lock:
                 self.active_alert_threads -= 1
 
@@ -370,7 +425,7 @@ def _run_upload_pipeline(job_id: str, video_path: str):
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        state = DetectionState(fps=fps, play_audio=False)
+        state = DetectionState(fps=fps, play_audio=True)
         with jobs_lock:
             job["detection_state"] = state
 

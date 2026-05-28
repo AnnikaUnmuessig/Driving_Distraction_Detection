@@ -17,7 +17,7 @@ export function WebcamSource() {
   const [videomaeOn, setVideomaeOn] = useState(true);
   const [actionInterval, setActionInterval] = useState(1.0);
 
-  const { status, frameUrl, alerts, handState, connect, disconnect, sendMessage } = useVideoStream(wsUrl);
+  const { status, frameUrl, alerts, handState, latestVoiceAlert, connect, disconnect, sendMessage } = useVideoStream(wsUrl);
 
   const isStreaming = status === "streaming" || status === "connecting";
 
@@ -48,6 +48,7 @@ export function WebcamSource() {
 
   return (
     <VideoPanel label="live webcam" frameUrl={frameUrl} alerts={alerts} status={status}
+      latestVoiceAlert={latestVoiceAlert}
       confirmedHandState={handState.confirmed}
       pendingCount={handState.pendingCount}
       debounceThreshold={3}>

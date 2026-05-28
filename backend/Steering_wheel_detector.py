@@ -122,7 +122,7 @@ def detect_steering_and_hands(frame_or_path, steering_box=None):
     # ── MediaPipe detection ───────────────────────────────────────────────────
     hand_result = hand_detector.detect(mp_image)
     pose_result = pose_detector.detect(mp_image)
-    print(f"Hand result: {hand_result}")
+    #print(f"Hand result: {hand_result}")
     detected_hands = []
     left_on = False
     right_on = False

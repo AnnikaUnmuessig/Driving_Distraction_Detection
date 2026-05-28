@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export type AlertEvent = {
-  type: "alert" | "done" | "error" | "hand_state";
+  type: "alert" | "done" | "error" | "hand_state" | "alert_text";
   distraction_type?: string;
   severity?: string;
   message?: string;
+  text?: string;
   confirmed?: { left: boolean; right: boolean };
   pending_count?: number;
 };
@@ -21,6 +22,8 @@ export function useVideoStream(url: string | null) {
     pendingCount: 0
   });
   const prevBlobUrl = useRef<string | null>(null);
+  const [latestVoiceAlert, setLatestVoiceAlert] = useState<{ text: string; severity: string } | null>(null);
+  const voiceAlertTimeoutRef = useRef<any>(null);
 
   const connect = useCallback(() => {
     if (!url || wsRef.current) return;
@@ -44,6 +47,19 @@ export function useVideoStream(url: string | null) {
             confirmed: event.confirmed || { left: true, right: true },
             pendingCount: event.pending_count || 0
           });
+        } else if (event.type === "alert_text") {
+          setLatestVoiceAlert({
+            text: event.text || "",
+            severity: event.severity || "light"
+          });
+          setAlerts((prev) => [event, ...prev].slice(0, 50));
+          
+          if (voiceAlertTimeoutRef.current) {
+            clearTimeout(voiceAlertTimeoutRef.current);
+          }
+          voiceAlertTimeoutRef.current = setTimeout(() => {
+            setLatestVoiceAlert(null);
+          }, 4000);
         } else {
           setAlerts((prev) => [event, ...prev].slice(0, 50));
         }
@@ -70,6 +86,11 @@ export function useVideoStream(url: string | null) {
     wsRef.current = null;
     setStatus("idle");
     setFrameUrl(null);
+    if (voiceAlertTimeoutRef.current) {
+      clearTimeout(voiceAlertTimeoutRef.current);
+      voiceAlertTimeoutRef.current = null;
+    }
+    setLatestVoiceAlert(null);
   }, []);
 
   const sendMessage = useCallback((msg: object) => {
@@ -86,7 +107,12 @@ export function useVideoStream(url: string | null) {
     }
   }, [url, connect, disconnect]);
 
-  useEffect(() => () => { wsRef.current?.close(); }, []);
+  useEffect(() => () => {
+    wsRef.current?.close();
+    if (voiceAlertTimeoutRef.current) {
+      clearTimeout(voiceAlertTimeoutRef.current);
+    }
+  }, []);
 
-  return { status, frameUrl, alerts, handState, connect, disconnect, sendMessage };
+  return { status, frameUrl, alerts, handState, latestVoiceAlert, connect, disconnect, sendMessage };
 }

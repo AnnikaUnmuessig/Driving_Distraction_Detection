@@ -18,6 +18,33 @@ DEBOUNCE_THRESHOLD = 3         # number of consecutive detections to confirm sta
 ACTION_CONFIDENCE_THRESHOLD = 0.5  # confidence threshold for action alerts
 EMA_ALPHA = 1.0                # Deprecated, no longer used
 
+# ── Warning severity per action class ──────────────────────────────────────
+# Maps model class label strings → warning_type passed to the LLM.
+# 'safe_driving' is intentionally omitted — no alert is fired for it.
+ACTION_WARNING_MAP: dict[str, str] = {
+    # ── High risk — phone / texting ───────────────────────────────────────
+    "texting_right"  : "heavy",
+    "texting_left"   : "heavy",
+    "phonecall_right": "heavy",
+    "phonecall_left" : "heavy",
+    # ── Medium risk — hands / eyes away from wheel ───────────────────────
+    "drinking"       : "light-mid",
+    "reach_side"     : "light-mid",
+    "hair_and_makeup": "light-mid",
+    # ── Low risk — brief / momentary distraction ────────────────────────
+    "radio"          : "light",
+}
+
+def get_action_warning_type(predicted_class: str) -> str:
+    """Return the warning severity for a given model class label.
+
+    Returns None for 'safe_driving' so the caller can skip the alert entirely.
+    Falls back to 'moderate' for any class not listed in ACTION_WARNING_MAP.
+    """
+    if predicted_class == "safe_driving" or predicted_class== "change_gear":
+        return None  # no alert for safe behaviour
+    return ACTION_WARNING_MAP.get(predicted_class, "moderate")
+
 
 class ActionRecognitionWorker:
     """Background thread worker for action recognition inference"""
@@ -277,15 +304,17 @@ def run_pipeline(video_path=None):
     alert_lock = threading.Lock()
     alert_active = False
 
-    def fire_alert(distraction_output, video_timestamp):
+    def fire_alert(distraction_output, warning_type: str, video_timestamp):
         nonlocal alert_active
         try:
-            audio_bytes = generate_safety_alert_all_groq(distraction_output)
+            audio_bytes, warning_text = generate_safety_alert_all_groq(distraction_output, warning_type=warning_type)
 
             if isinstance(audio_bytes, bytes) and len(audio_bytes) > 0:
                 with alert_log_lock:
                     alert_log.append((video_timestamp, audio_bytes))
-                print(f"[INFO] Alert audio captured ({len(audio_bytes):,} bytes) @ {video_timestamp:.2f}s")
+                print(f"[INFO] Alert audio captured ({len(audio_bytes):,} bytes) @ {video_timestamp:.2f}s  [warning_type={warning_type!r}]")
+                if warning_text:
+                    print(f"Spoken text: \"{warning_text}\"")
             else:
                 print("[WARN] generate_safety_alert_all_groq returned no bytes")
 
@@ -295,7 +324,15 @@ def run_pipeline(video_path=None):
             with alert_lock:
                 alert_active = False
 
-    def trigger_alert(distraction_output):
+    def trigger_alert(distraction_output, warning_type: str = "moderate"):
+        """Fire an audio alert in a background thread.
+
+        Args:
+            distraction_output: dict describing what the driver is doing
+                                (keys: 'distracted', 'distraction_type').
+            warning_type: severity of the alert sent to the LLM/TTS pipeline
+                          (e.g. 'light', 'light-mid', 'heavy').
+        """
         nonlocal alert_active
 
         with alert_lock:
@@ -305,11 +342,11 @@ def run_pipeline(video_path=None):
             alert_active = True
             video_timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-        print(f"[ALERT] Fired at video_time={video_timestamp:.3f}s")
+        print(f"[ALERT] Fired at video_time={video_timestamp:.3f}s  [warning_type={warning_type!r}]")
 
         threading.Thread(
             target=fire_alert,
-            args=(distraction_output, video_timestamp),
+            args=(distraction_output, warning_type, video_timestamp),
             daemon=True
         ).start()
         return True
@@ -378,12 +415,23 @@ def run_pipeline(video_path=None):
             if frame_count % 15 == 0:
                 print(f"Hands off wheel for {hands_off_duration:.1f}s")
 
-            if hands_off_duration >= HANDS_OFF_THRESHOLD:
-                alert_was_fired = trigger_alert({
-                    "distracted": "yes",
-                    "distraction_type": "hands off wheel",
-                    "type of warning": "mid-heavy"
-                })
+            if hands_off_duration >= HANDS_OFF_THRESHOLD and (
+            (confirmed_hand_state["left"] == False and confirmed_hand_state["right"] == True) or
+            (confirmed_hand_state["left"] == True  and confirmed_hand_state["right"] == False)):
+                alert_was_fired = trigger_alert(
+                    {"distracted": "yes", "distraction_type": "one hand off wheel"},
+                    warning_type="light"
+                )
+                hands_off_since = current_time
+
+                if alert_was_fired:
+                    print("[ALERT] Started - Blocking new triggers until voice finishes.")
+
+            if hands_off_duration >= HANDS_OFF_THRESHOLD and confirmed_hand_state["left"] == False and confirmed_hand_state["right"] == False:
+                alert_was_fired = trigger_alert(
+                    {"distracted": "yes", "distraction_type": "both hands off wheel"},
+                    warning_type="heavy"
+                )
                 hands_off_since = current_time
 
                 if alert_was_fired:
@@ -401,13 +449,22 @@ def run_pipeline(video_path=None):
             action = classify_action(frames_buffer)
 
             if action:
-                print(f"[WARN] Distraction detected: {action}")
-                trigger_alert({
-                    "distracted": "yes",
-                    "distraction_type": action,
-                    "type of warning": "light-mid"
-                })
-                last_status_text.append((f"⚠ {action.upper()}", (0, 165, 255)))
+                predicted_class = action.get("predicted_class", "unknown")
+                confidence      = action.get("confidence", 0.0)
+                warning_type    = get_action_warning_type(predicted_class)
+
+                if warning_type is None:  # safe_driving — no alert
+                    print(f"[OK] Safe driving detected (conf={confidence:.2f}) — no alert.")
+                else:
+                    print(
+                        f"[WARN] Action detected: '{predicted_class}' "
+                        f"(conf={confidence:.2f}, warning_type={warning_type!r})"
+                    )
+                    trigger_alert(
+                        {"distracted": "yes", "distraction_type": predicted_class},
+                        warning_type=warning_type
+                    )
+                    last_status_text.append((f"⚠ {predicted_class.upper()}", (0, 165, 255)))
 
         # ── 3. COMPOSE OUTPUT FRAME ──
         # Re-draw landmarks on the current fresh frame every iteration to avoid stale overlays

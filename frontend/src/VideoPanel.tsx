@@ -10,19 +10,22 @@ type Props = {
   confirmedHandState?: { left: boolean; right: boolean };
   pendingCount?: number;
   debounceThreshold?: number;
+  latestVoiceAlert?: { text: string; severity: string } | null;
   children?: React.ReactNode;
 };
 
 const SEV_COLORS: Record<string, { bg: string; fg: string; dot: string }> = {
+  "heavy":     { bg: "rgba(239, 68, 68, 0.18)", fg: "#f87171", dot: "#ef4444" },
   "mid-heavy": { bg: "rgba(163,45,45,0.18)", fg: "#f87171", dot: "#ef4444" },
-  mid:         { bg: "rgba(180,120,0,0.18)",  fg: "#fbbf24", dot: "#f59e0b" },
+  "mid":       { bg: "rgba(180,120,0,0.18)",  fg: "#fbbf24", dot: "#f59e0b" },
   "light-mid": { bg: "rgba(30,160,80,0.18)",  fg: "#4ade80", dot: "#22c55e" },
+  "light":     { bg: "rgba(59, 130, 246, 0.18)", fg: "#93c5fd", dot: "#3b82f6" },
 };
 
 export function VideoPanel({
   label, frameUrl, alerts, status, progress,
   confirmedHandState, pendingCount = 0, debounceThreshold = 3,
-  children,
+  latestVoiceAlert, children,
 }: Props) {
   const left  = confirmedHandState?.left  ?? true;
   const right = confirmedHandState?.right ?? true;
@@ -62,6 +65,55 @@ export function VideoPanel({
 
 
 
+        {/* Floating Voice Alert Banner */}
+        {latestVoiceAlert && (() => {
+          const sev = SEV_COLORS[latestVoiceAlert.severity] || { fg: "#c084fc", dot: "#a78bfa" };
+          return (
+            <div style={{
+              position: "absolute",
+              bottom: 12,
+              left: 12,
+              right: 12,
+              background: "rgba(9, 9, 13, 0.9)",
+              backdropFilter: "blur(12px)",
+              border: `1px solid ${sev.dot}88`,
+              borderRadius: 6,
+              padding: "10px 14px",
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+              zIndex: 10,
+              boxShadow: `0 4px 20px rgba(0, 0, 0, 0.6), 0 0 12px ${sev.dot}22`,
+              animation: "pulse 2s ease-in-out infinite",
+            }}>
+              <span style={{ fontSize: 16, filter: `drop-shadow(0 0 4px ${sev.dot})` }}>🔊</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{
+                  fontFamily: "'JetBrains Mono', monospace",
+                  fontSize: 9,
+                  fontWeight: 700,
+                  color: sev.fg,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase"
+                }}>
+                  AI Voice Alert ({latestVoiceAlert.severity})
+                </div>
+                <div style={{
+                  fontFamily: "inherit",
+                  fontSize: 11,
+                  color: "#fff",
+                  marginTop: 3,
+                  fontWeight: 500,
+                  lineHeight: "1.3",
+                  wordBreak: "break-word"
+                }}>
+                  "{latestVoiceAlert.text}"
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
         {/* corner brackets */}
         {["tl","tr","bl","br"].map(c => <CornerBracket key={c} corner={c as any} />)}
       </div>
@@ -94,18 +146,29 @@ export function VideoPanel({
         {alerts.length === 0 ? (
           <div style={{ color: "rgba(255,255,255,0.2)", padding: "4px 0" }}>— no alerts —</div>
         ) : alerts.map((a, i) => {
+          const isText = a.type === "alert_text";
           const sev = SEV_COLORS[a.severity ?? ""] ?? { bg: "rgba(255,255,255,0.05)", fg: "#aaa", dot: "#888" };
           return (
             <div key={i} style={{ display: "flex", alignItems: "center", gap: 6,
-              padding: "4px 8px", borderRadius: 4, background: sev.bg,
-              border: `1px solid ${sev.dot}33` }}>
-              <span style={{ width: 5, height: 5, borderRadius: "50%",
-                background: sev.dot, flexShrink: 0, boxShadow: `0 0 4px ${sev.dot}` }} />
-              <span style={{ color: sev.fg, flex: 1, letterSpacing: "0.04em" }}>
-                {a.distraction_type ?? a.message ?? "event"}
+              padding: "4px 8px", borderRadius: 4,
+              background: isText ? "rgba(139,92,246,0.08)" : sev.bg,
+              border: `1px solid ${isText ? "rgba(139,92,246,0.25)" : sev.dot + "33"}` }}>
+              {isText ? (
+                <span style={{ fontSize: 11, flexShrink: 0 }}>🔊</span>
+              ) : (
+                <span style={{ width: 5, height: 5, borderRadius: "50%",
+                  background: sev.dot, flexShrink: 0, boxShadow: `0 0 4px ${sev.dot}` }} />
+              )}
+              <span style={{
+                color: isText ? "#c084fc" : sev.fg,
+                flex: 1,
+                letterSpacing: "0.04em",
+                fontStyle: isText ? "italic" : "normal"
+              }}>
+                {isText ? `"${a.text}"` : (a.distraction_type ?? a.message ?? "event")}
               </span>
               <span style={{ color: "rgba(255,255,255,0.25)", fontSize: 9 }}>
-                {a.severity ?? "alert"}
+                {isText ? "voice alert" : (a.severity ?? "alert")}
               </span>
             </div>
           );

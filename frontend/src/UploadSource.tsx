@@ -17,7 +17,7 @@ export function UploadSource() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const wsUrl = job ? `${API_WS}/stream/upload/${job.job_id}` : null;
-  const { status: streamStatus, frameUrl, alerts, handState, connect, disconnect, sendMessage } = useVideoStream(wsUrl);
+  const { status: streamStatus, frameUrl, alerts, handState, latestVoiceAlert, connect, disconnect, sendMessage } = useVideoStream(wsUrl);
 
   const handleFile = (f: File) => {
     setFile(f);
@@ -65,6 +65,7 @@ export function UploadSource() {
       pendingCount={handState.pendingCount}
       debounceThreshold={3}
       progress={job?.progress}
+      latestVoiceAlert={latestVoiceAlert}
     >
       {/* ── controls slot ── */}
       <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
