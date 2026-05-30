@@ -1,10 +1,28 @@
+import os
+import shutil
+
+def _locate_and_add_ffmpeg_to_path():
+    if shutil.which("ffmpeg") is not None:
+        return
+    if os.name == 'nt':
+        common_paths = [
+            r"C:\Program Files\DownloadHelper CoApp",
+            r"C:\Program Files (x86)\DownloadHelper CoApp",
+        ]
+        for p in common_paths:
+            if os.path.exists(os.path.join(p, "ffmpeg.exe")):
+                os.environ["PATH"] = p + os.pathsep + os.environ["PATH"]
+                print(f"[INFO] Added {p} to PATH for FFmpeg.")
+                return
+
+_locate_and_add_ffmpeg_to_path()
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from elevenlabs.client import ElevenLabs
 from elevenlabs import stream
 from huggingface_hub import login
 import torch
 import time
-import os
 import simpleaudio as sa
 import numpy as np
 import subprocess
@@ -14,7 +32,6 @@ import io
 from pydub import AudioSegment
 from dotenv import load_dotenv
 from groq import Groq
-import pyttsx3
 
 load_dotenv()
 print("GROQ_API_KEY found:", os.environ.get("GROQ_API_KEY") is not None)
@@ -23,15 +40,32 @@ api_key = os.environ.get("GROQ_API_KEY")
 groq_client = Groq(api_key=api_key) if api_key else None
 
 
+def get_ffmpeg_cmd():
+    # Since we added FFmpeg to PATH, we can just use "ffmpeg" natively!
+    return "ffmpeg"
+
+
+
+
 def generate_safety_alert_all_groq(distraction_output, warning_type: str = "moderate", play_audio=True):
     start_time = time.time()
     warning_text = None
     raw_audio_bytes = None
 
     action_map = {
-        "drinking": "drinking from a bottle",
-        "radio": "operating radio buttons",
-        "hair_and_makeup": "fixing hair or applying makeup",
+        # Action recognition classes
+        "drinking": "drinking a beverage",
+        "radio": "adjusting the radio",
+        "hair_and_makeup": "fixing hair or makeup",
+        "texting_right": "texting with their right hand",
+        "texting_left": "texting with their left hand",
+        "phonecall_right": "making a phone call with their right hand",
+        "phonecall_left": "making a phone call with their left hand",
+        "reach_side": "reaching to the side",
+        
+        # Hand connection classes
+        "one hand off wheel": "driving with only one hand on the wheel",
+        "both hands off wheel": "driving with no hands on the steering wheel",
     }
     dtype_raw = distraction_output.get("distraction_type", "distraction")
     dtype_for_llm = action_map.get(dtype_raw, dtype_raw)
@@ -42,12 +76,25 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
             llm_response = groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
-                    {"role": "system", "content": "You are a car safety AI. Output a VERY short, one sentence, authoritative warning directly to the driver, consider the type of distraction."},
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an in-car safety assistant. Output a VERY short, concise, single-sentence warning (maximum 12 words) speaking directly to the driver. "
+                            "You MUST explicitly specify: "
+                            "1. The exact action being performed (e.g., texting, phone call, drinking, adjusting the radio). "
+                            "2. The specific hand involved if the input mentions left/right or hands-off status (e.g., 'right hand', 'left hand', 'one hand', 'both hands'). "
+                            "3. The severity/danger level of the risk based on the warning type: "
+                            "   - For 'light' warnings: state that it is a 'minor distraction' or 'low risk' (e.g., 'Adjusting the radio is a minor distraction, please focus'). "
+                            "   - For 'light-mid' warnings: state that it is 'unsafe', 'risky', or 'moderate risk' (e.g., 'Drinking while driving is unsafe, please keep hands on the wheel'). "
+                            "   - For 'heavy' warnings: state that it is 'highly dangerous', 'critical hazard', or 'extremely high risk' (e.g., 'Texting with your right hand is highly dangerous, stop immediately!'). "
+                            "Be direct, specific, and authoritative. Do not make generic warnings that could apply to anything. Never assume alcohol or illegal substances."
+                        )
+                    },
                     {"role": "user", "content": f"The driver is {dtype_for_llm}. Give a {warning_type} warning."}
                 ],
                 stream=False
             )
-            warning_text = llm_response.choices[0].message.content
+            warning_text = llm_response.choices[0].message.content.strip().strip('"\'').replace('"', "'")
             print(f"Assistant (Groq): {warning_text}")
         except Exception as e:
             print(f"[WARN] Groq LLM failed: {e}")
@@ -122,10 +169,17 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
     if raw_audio_bytes:
         if play_audio:
             try:
-                subprocess.run(["say", "-v", "Samantha", warning_text], check=True)
-                print("Alert played.")
+                import simpleaudio as sa
+                wave_obj = sa.WaveObject.from_wave_file(io.BytesIO(raw_audio_bytes))
+                play_obj = wave_obj.play()
+                play_obj.wait_done()
+                print("Alert played successfully via simpleaudio.")
             except Exception as playback_err:
-                print(f"Playback error: {playback_err}")
+                try:
+                    subprocess.run(["say", "-v", "Samantha", warning_text], check=True)
+                    print("Alert played via macOS say.")
+                except Exception as say_err:
+                    print(f"Playback error: {playback_err} | macOS say error: {say_err}")
 
         total_time = time.time() - start_time
         print(f"Total Alert Latency: {total_time:.3f}s")

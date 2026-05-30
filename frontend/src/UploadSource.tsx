@@ -12,6 +12,7 @@ export function UploadSource() {
   const [dragging, setDragging] = useState(false);
   const [mediapipeOn, setMediapipeOn] = useState(true);
   const [videomaeOn, setVideomaeOn] = useState(true);
+  const [audioOn, setAudioOn] = useState(true);
   const [isPaused, setIsPaused] = useState(false);
   const [actionInterval, setActionInterval] = useState(1.0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -36,6 +37,7 @@ export function UploadSource() {
     setIsPaused(false);
     setMediapipeOn(true);
     setVideomaeOn(true);
+    setAudioOn(true);
     setActionInterval(1.0);
     await upload(file); // Upload first, get job_id - WebSocket will connect automatically
   };
@@ -47,6 +49,7 @@ export function UploadSource() {
     setIsPaused(false);
     setMediapipeOn(true);
     setVideomaeOn(true);
+    setAudioOn(true);
     setActionInterval(1.0);
   };
 
@@ -80,6 +83,11 @@ export function UploadSource() {
               const next = !videomaeOn;
               setVideomaeOn(next);
               sendMessage({ type: "toggle", target: "videomae", enabled: next });
+            }} />
+            <ToggleButton label="Voice Alerts" on={audioOn} disabled={streamStatus !== "streaming"} onClick={() => {
+              const next = !audioOn;
+              setAudioOn(next);
+              sendMessage({ type: "toggle", target: "audio", enabled: next });
             }} />
             <select
               value={actionInterval}

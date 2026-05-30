@@ -38,12 +38,11 @@ from pipeline import (
     _convert_to_h264,
     ActionRecognitionWorker,
     ACTION_OVERLAP,
-    DEBOUNCE_THRESHOLD,
-    HANDS_OFF_THRESHOLD,
     VIDEOMAE_WINDOW_SIZE,
     WHEEL_DETECTION_INTERVAL,
     ACTION_CONFIDENCE_THRESHOLD,
     get_action_warning_type,
+    get_wav_duration,
 )
 
 UPLOAD_DIR = Path("uploads")
@@ -105,8 +104,8 @@ class DetectionState:
         self.last_alert_time: float = 0.0
         self.last_detection_result: Optional[dict] = None
         self.confirmed_hand_state: dict = {"left": True, "right": True}
-        self.pending_hand_state: Optional[dict] = None
-        self.pending_count: int = 0
+        self.hand_off_frames: dict = {"left": 0, "right": 0}
+        self.hand_on_frames: dict = {"left": 0, "right": 0}
         self.active_alert_threads: int = 0
         self.alert_lock = threading.Lock()
         self.alert_log: list = []
@@ -116,8 +115,20 @@ class DetectionState:
         self.audio_playing = False
         self.audio_playing_lock = threading.Lock()
 
+        # Cooldown parameters and states
+        self.same_action_cooldown: float = 5.0
+        self.diff_action_cooldown: float = 2.0
+        self.last_alert_finished_time: float = 0.0
+        self.last_alert_distraction_type: Optional[str] = None
+
+        # Debounce and hands-off thresholds
+        self.debounce_off_frames: int = 15
+        self.debounce_on_frames: int = 3
+        self.hands_off_one_hand_threshold: float = 5.0
+        self.hands_off_both_hands_threshold: float = 2.0
+
         # Action persistence: only warn if the same warning-worthy action persists.
-        self.action_persist_sec: float = 4.0
+        self.action_persist_sec: float = 2.0
         self.action_candidate: Optional[str] = None
         self.action_candidate_since_sec: Optional[float] = None
         self.action_candidate_last_seen_sec: Optional[float] = None
@@ -126,6 +137,11 @@ class DetectionState:
         self.mediapipe_enabled: bool = True
         self.videomae_enabled: bool = True
         self.paused: bool = False
+
+        # EMA smoothing for action recognition probabilities
+        self.smoothed_probs = None
+        self.ema_alpha = 0.4
+        self.voice_alerts_enabled = True
 
 
         # Action recognition worker
@@ -185,6 +201,7 @@ class DetectionState:
                 break
 
         time_sec = cap_msec / 1000.0 if not self.play_audio else current_time
+        video_time_sec = cap_msec / 1000.0
 
         action_alert_fired = False  # track if action fired this frame
         hand_alert_pending = None   # store hand alert to fire later
@@ -208,31 +225,26 @@ class DetectionState:
                 result["steering_box"] = self.cached_steering_box
 
             self.last_detection_result = result
-            new_state = {"left": result["left_hand_on"], "right": result["right_hand_on"]}
+            old_state = self.confirmed_hand_state.copy()
+            # ── Debounce logic (independent Left and Right hand checks) ──
+            for side in ["left", "right"]:
+                is_detected_on = result[f"{side}_hand_on"]
+                if is_detected_on:
+                    self.hand_on_frames[side] += 1
+                    self.hand_off_frames[side] = 0
+                    if self.hand_on_frames[side] >= self.debounce_on_frames:
+                        self.confirmed_hand_state[side] = True
+                else:
+                    self.hand_off_frames[side] += 1
+                    self.hand_on_frames[side] = 0
+                    if self.hand_off_frames[side] >= self.debounce_off_frames:
+                        self.confirmed_hand_state[side] = False
 
-            if new_state == self.confirmed_hand_state:
-                self.pending_hand_state = None
-                self.pending_count = 0
-            elif new_state == self.pending_hand_state:
-                self.pending_count += 1
-                if self.pending_count >= DEBOUNCE_THRESHOLD:
-                    old_state = self.confirmed_hand_state.copy()
-                    self.confirmed_hand_state = new_state
-                    self.pending_hand_state = None
-                    self.pending_count = 0
-                    if old_state != self.confirmed_hand_state:
-                        events.append({
-                            "type": "hand_state",
-                            "confirmed": self.confirmed_hand_state,
-                            "pending_count": self.pending_count
-                        })
-            else:
-                self.pending_hand_state = new_state
-                self.pending_count = 1
+            if old_state != self.confirmed_hand_state:
                 events.append({
                     "type": "hand_state",
                     "confirmed": self.confirmed_hand_state,
-                    "pending_count": self.pending_count
+                    "pending_count": 0
                 })
 
             hands_on = self.confirmed_hand_state["left"] and self.confirmed_hand_state["right"]
@@ -246,12 +258,12 @@ class DetectionState:
                 right_off = not self.confirmed_hand_state["right"]
 
                 # Store hand alert as pending — don't fire yet
-                if off_duration >= HANDS_OFF_THRESHOLD and left_off != right_off:
+                if left_off != right_off and off_duration >= self.hands_off_one_hand_threshold:
                     hand_alert_pending = (
                         {"distracted": "yes", "distraction_type": "one hand off wheel"},
                         "light"
                     )
-                elif off_duration >= HANDS_OFF_THRESHOLD and left_off and right_off:
+                elif left_off and right_off and off_duration >= self.hands_off_both_hands_threshold:
                     hand_alert_pending = (
                         {"distracted": "yes", "distraction_type": "both hands off wheel"},
                         "heavy"
@@ -274,17 +286,46 @@ class DetectionState:
                 sampled_frames = [self.frames_buffer[i] for i in indices]
                 self.action_worker.queue_frames(sampled_frames)
 
-            result = self.action_worker.get_result()
-            if result:
-                result_id = result.get("result_id", 0)
+            action_result = self.action_worker.get_result()
+            if action_result:
+                result_id = action_result.get("result_id", 0)
                 if result_id > self.last_processed_result_id:
                     self.last_processed_result_id = result_id
-                    self.latest_action_result = result
                     self.latest_action_result_time_sec = time_sec
 
-                    action = result.get("predicted_class")
-                    confidence = float(result.get("confidence", 0) or 0)
-                    self._update_action_candidate_from_result(action, confidence, time_sec)
+                    # Apply EMA smoothing to the raw action probabilities
+                    raw_probs = action_result.get("probs")
+                    if raw_probs and self.action_worker.recognizer:
+                        if self.smoothed_probs is None:
+                            self.smoothed_probs = list(raw_probs)
+                        else:
+                            self.smoothed_probs = [
+                                self.ema_alpha * curr + (1.0 - self.ema_alpha) * smooth
+                                for curr, smooth in zip(raw_probs, self.smoothed_probs)
+                            ]
+
+                        # Determine the smoothed action and confidence
+                        max_idx = int(np.argmax(self.smoothed_probs))
+                        id2label = self.action_worker.recognizer.id2label
+                        smoothed_action = id2label[max_idx]
+                        smoothed_confidence = self.smoothed_probs[max_idx]
+
+                        # Update self.latest_action_result with smoothed predictions for display on the frontend
+                        sorted_indices = sorted(range(len(self.smoothed_probs)), key=lambda i: self.smoothed_probs[i], reverse=True)
+                        self.latest_action_result = {
+                            "predicted_class": smoothed_action,
+                            "confidence": round(smoothed_confidence, 4),
+                            "top_k": [(id2label[i], round(self.smoothed_probs[i], 4)) for i in sorted_indices[:3]],
+                            "result_id": result_id
+                        }
+
+                        self._update_action_candidate_from_result(smoothed_action, smoothed_confidence, time_sec)
+                    else:
+                        # Fallback if probs or recognizer is not available
+                        action = action_result.get("predicted_class")
+                        confidence = float(action_result.get("confidence", 0) or 0)
+                        self.latest_action_result = action_result
+                        self._update_action_candidate_from_result(action, confidence, time_sec)
 
                     persisted_action = self._get_persisted_action(time_sec)
                     if persisted_action:
@@ -295,6 +336,7 @@ class DetectionState:
                                 warning_type=warning_type,
                                 timestamp_sec=time_sec,
                                 trigger_source="action",
+                                video_time_sec=video_time_sec,
                             )
                             if fired:
                                 action_alert_fired = True  # mark action as fired
@@ -310,47 +352,27 @@ class DetectionState:
             with self.audio_playing_lock:
                 audio_busy = self.audio_playing
             if not audio_busy:
-                # If hands are off wheel:
-                # - If current action == safe_driving -> warn hands-off
-                # - Else -> only warn once a warning-worthy action persists for action_persist_sec seconds
-                ar = self.latest_action_result
-                recent_action = (
-                    ar is not None
-                    and (time_sec - self.latest_action_result_time_sec)
-                    <= max(0.25, self.action_interval_sec * 1.25)
+                # Prioritize actions: if a warning-worthy action candidate is active, do NOT alert about hands-off.
+                # Just let the action persistence run.
+                recent_action_active = (
+                    self.action_candidate is not None
+                    and get_action_warning_type(self.action_candidate) is not None
                 )
-                current_action = ar.get("predicted_class") if (ar and recent_action) else None
 
-                if current_action and current_action != "safe_driving":
-                    persisted_action = self._get_persisted_action(time_sec)
-                    if persisted_action:
-                        warning_type = get_action_warning_type(persisted_action)
-                        if warning_type is not None:
-                            fired = self._trigger_alert(
-                                {"distracted": "yes", "distraction_type": persisted_action},
-                                warning_type=warning_type,
-                                timestamp_sec=time_sec,
-                                trigger_source="action",
-                            )
-                            if fired:
-                                action_alert_fired = True
-                                events.append({
-                                    "type": "alert",
-                                    "distraction_type": persisted_action,
-                                    "severity": warning_type,
-                                    "trigger_source": "action",
-                                })
-
-                    # Do not fall back to hands-off while a non-safe action is present.
+                if recent_action_active:
+                    # Do not fall back to hands-off while a non-safe action is active.
                     self.frame_count += 1
                     output_frame = self._annotate(frame, w, h)
                     return {"frame": output_frame, "events": events}
+
+                # Otherwise, if no active warning action, trigger hands-off warning
                 distraction_output, warning_type = hand_alert_pending
                 fired = self._trigger_alert(
                     distraction_output,
                     warning_type=warning_type,
                     timestamp_sec=time_sec,
                     trigger_source="hands_off",
+                    video_time_sec=video_time_sec,
                 )
                 if fired:
                     self.hands_off_since = time_sec
@@ -364,12 +386,21 @@ class DetectionState:
         output_frame = self._annotate(frame, w, h)
         return {"frame": output_frame, "events": events}
 
-    def _trigger_alert(self, distraction_output, warning_type: str, timestamp_sec: float, trigger_source: str):
+    def _trigger_alert(self, distraction_output, warning_type: str, timestamp_sec: float, trigger_source: str, video_time_sec: float):
+        if not self.voice_alerts_enabled:
+            return False
+        distraction_type = distraction_output.get("distraction_type", "distraction")
         with self.alert_lock:
-            print(f"[DEBUG] _trigger_alert called, audio_playing={self.audio_playing}, last_alert_time={self.last_alert_time:.2f}, timestamp={timestamp_sec:.2f}")
-            if timestamp_sec - self.last_alert_time < 5:
-                print(f"[BLOCKED] Cooldown active")
-                return False
+            print(f"[DEBUG] _trigger_alert called, audio_playing={self.audio_playing}, last_alert_finished_time={self.last_alert_finished_time:.2f}, timestamp={timestamp_sec:.2f}, video_time_sec={video_time_sec:.2f}")
+            
+            # Cooldown check
+            if self.last_alert_distraction_type is not None:
+                elapsed = timestamp_sec - self.last_alert_finished_time
+                cooldown = self.same_action_cooldown if distraction_type == self.last_alert_distraction_type else self.diff_action_cooldown
+                if elapsed < cooldown:
+                    print(f"   [COOLDOWN BLOCKED] distraction={distraction_type!r}, elapsed={elapsed:.1f}s < cooldown={cooldown}s (last={self.last_alert_distraction_type!r})")
+                    return False
+
             with self.audio_playing_lock:
                 if self.audio_playing:
                     print("[BLOCKED] Audio still playing")
@@ -381,19 +412,27 @@ class DetectionState:
         print(f"[DEBUG] Spawning alert thread")
         threading.Thread(
             target=self._fire_alert,
-            args=(distraction_output, warning_type, timestamp_sec, self.play_audio, trigger_source),
+            args=(distraction_output, warning_type, timestamp_sec, self.play_audio, trigger_source, video_time_sec),
             daemon=False
         ).start()
         return True
 
-    def _fire_alert(self, distraction_output, warning_type: str, video_timestamp, play_audio, trigger_source: str):
+    def _fire_alert(self, distraction_output, warning_type: str, timestamp_sec, play_audio, trigger_source: str, video_time_sec: float):
+        distraction_type = distraction_output.get("distraction_type", "distraction")
         try:
             audio_bytes, warning_text = generate_safety_alert_all_groq(
                 distraction_output, warning_type=warning_type, play_audio=play_audio
             )
             if isinstance(audio_bytes, bytes) and audio_bytes:
                 with self.alert_log_lock:
-                    self.alert_log.append((video_timestamp, audio_bytes))
+                    # Save the video-relative time for FFmpeg mixing
+                    self.alert_log.append((video_time_sec, audio_bytes))
+                
+                dur = get_wav_duration(audio_bytes)
+                # Keep cooldown timeline aligned with the time base used in trigger_alert
+                self.last_alert_finished_time = timestamp_sec + dur
+                self.last_alert_distraction_type = distraction_type
+                
             if warning_text:
                 self.async_events.put({
                     "type": "alert_text",
@@ -527,7 +566,7 @@ def _run_upload_pipeline(job_id: str, video_path: str):
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        state = DetectionState(fps=fps, play_audio=True)
+        state = DetectionState(fps=fps, play_audio=False)
         with jobs_lock:
             job["detection_state"] = state
 
@@ -674,6 +713,8 @@ async def stream_upload_frames(websocket: WebSocket, job_id: str):
                             ds.mediapipe_enabled = enabled
                         elif target == "videomae":
                             ds.videomae_enabled = enabled
+                        elif target == "audio":
+                            ds.play_audio = enabled
                 elif data.get("type") == "pause":
                     with jobs_lock:
                         ds = job.get("detection_state")
@@ -754,6 +795,8 @@ async def stream_webcam(websocket: WebSocket, cam_index: int = 0):
                         state.mediapipe_enabled = enabled
                     elif target == "videomae":
                         state.videomae_enabled = enabled
+                    elif target == "audio":
+                        state.play_audio = enabled
                 elif data.get("type") == "config":
                     key = data.get("key")
                     val = data.get("value")

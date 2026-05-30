@@ -6,15 +6,35 @@ import os
 import subprocess
 import queue
 from Steering_wheel_detector import detect_steering_and_hands, draw_landmarks_on_image, draw_pose_markers
-from Feedback import generate_safety_alert_all_groq
+from Feedback import generate_safety_alert_all_groq, get_ffmpeg_cmd
 from action_recognition import ActionRecognizer
 
+def get_wav_duration(audio_bytes: bytes) -> float:
+    """Return duration of WAV audio bytes in seconds.
+    
+    If it's not a valid WAV or fails to parse, fallback to 2.0s.
+    """
+    import wave
+    import io
+    try:
+        with wave.open(io.BytesIO(audio_bytes), 'rb') as wav:
+            frames = wav.getnframes()
+            rate = wav.getframerate()
+            return frames / float(rate)
+    except Exception:
+        return 2.0
+
 # Fixed variables
-HANDS_OFF_THRESHOLD = 1        # seconds temporarily low
+SAME_ACTION_COOLDOWN = 5.0      # seconds
+DIFF_ACTION_COOLDOWN = 2.0      # seconds
+
+HANDS_OFF_ONE_HAND_THRESHOLD = 5.0    # seconds
+HANDS_OFF_BOTH_HANDS_THRESHOLD = 2.0   # seconds
 WHEEL_DETECTION_INTERVAL = 1   # seconds
 VIDEOMAE_WINDOW_SIZE = 16      # number of frames for action classification
 ACTION_OVERLAP = 30             # start new action classification every 30 frames
-DEBOUNCE_THRESHOLD = 3         # number of consecutive detections to confirm state change
+DEBOUNCE_OFF_FRAMES = 15       # frames (0.5s at 30fps) to confirm hand is off
+DEBOUNCE_ON_FRAMES = 3         # frames (0.1s at 30fps) to confirm hand is back on
 ACTION_CONFIDENCE_THRESHOLD = 0.5  # confidence threshold for action alerts
 EMA_ALPHA = 1.0                # Deprecated, no longer used
 
@@ -155,7 +175,7 @@ def build_audio_track(alert_log, total_duration_seconds):
             temp_files.append(tmp.name)
 
         # 2. Build FFmpeg command
-        cmd = ["ffmpeg", "-y"]
+        cmd = [get_ffmpeg_cmd(), "-y"]
         for path in temp_files:
             cmd += ["-i", path]
 
@@ -211,7 +231,7 @@ def build_audio_track(alert_log, total_duration_seconds):
 def _convert_to_h264(input_path, output_path):
     """Re-encodes a video file to browser-compatible H.264 using FFmpeg."""
     cmd = [
-        "ffmpeg", "-y",
+        get_ffmpeg_cmd(), "-y",
         "-i", input_path,
         "-vf", "yadif",
         "-c:v", "libx264",
@@ -236,7 +256,7 @@ def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_
     Audio is hard-trimmed to total_duration_seconds. Video is re-encoded to H.264.
     """
     cmd = [
-        "ffmpeg", "-y",
+        get_ffmpeg_cmd(), "-y",
         "-i", silent_video_path,    # video from file
         "-f", "s16le",              # raw PCM from stdin
         "-ar", "44100",
@@ -285,6 +305,12 @@ def run_pipeline(video_path=None):
     alert_log = []
     alert_log_lock = threading.Lock()
 
+    # Action recognition worker and EMA smoothing state
+    action_worker = ActionRecognitionWorker()
+    action_worker.start()
+    smoothed_probs = None
+    ema_alpha = 0.4
+
     # State tracking
     hands_off_since = None
     last_roboflow_time = 0
@@ -295,24 +321,36 @@ def run_pipeline(video_path=None):
     last_detection_result = None
     last_status_text = []
 
-    # Debounce state
+    # Action recognition state for prioritizing specific alerts over generic hands-off warnings
+    last_predicted_action = None
+    last_predicted_action_time = 0.0
+
+    # Debounce state (independent counters for left/right hands)
     confirmed_hand_state = {"left": True, "right": True}
-    pending_hand_state = None
-    pending_count = 0
+    hand_off_frames = {"left": 0, "right": 0}
+    hand_on_frames = {"left": 0, "right": 0}
 
     # Alert threading state
     alert_lock = threading.Lock()
     alert_active = False
+    last_alert_finished_video_time = 0.0
+    last_alert_distraction_type = None
 
     def fire_alert(distraction_output, warning_type: str, video_timestamp):
-        nonlocal alert_active
+        nonlocal alert_active, last_alert_finished_video_time, last_alert_distraction_type
+        distraction_type = distraction_output.get("distraction_type", "distraction")
         try:
             audio_bytes, warning_text = generate_safety_alert_all_groq(distraction_output, warning_type=warning_type)
 
             if isinstance(audio_bytes, bytes) and len(audio_bytes) > 0:
                 with alert_log_lock:
                     alert_log.append((video_timestamp, audio_bytes))
-                print(f"[INFO] Alert audio captured ({len(audio_bytes):,} bytes) @ {video_timestamp:.2f}s  [warning_type={warning_type!r}]")
+                
+                dur = get_wav_duration(audio_bytes)
+                last_alert_finished_video_time = video_timestamp + dur
+                last_alert_distraction_type = distraction_type
+                
+                print(f"[INFO] Alert audio captured ({len(audio_bytes):,} bytes, duration={dur:.2f}s) @ {video_timestamp:.2f}s  [warning_type={warning_type!r}]")
                 if warning_text:
                     print(f"Spoken text: \"{warning_text}\"")
             else:
@@ -333,14 +371,25 @@ def run_pipeline(video_path=None):
             warning_type: severity of the alert sent to the LLM/TTS pipeline
                           (e.g. 'light', 'light-mid', 'heavy').
         """
-        nonlocal alert_active
+        nonlocal alert_active, last_alert_finished_video_time, last_alert_distraction_type
+
+        distraction_type = distraction_output.get("distraction_type", "distraction")
+        video_timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
         with alert_lock:
             if alert_active:
                 print(f"   [BLOCKED] Alert already active")
                 return False
+            
+            # Cooldown check
+            if last_alert_distraction_type is not None:
+                elapsed = video_timestamp - last_alert_finished_video_time
+                cooldown = SAME_ACTION_COOLDOWN if distraction_type == last_alert_distraction_type else DIFF_ACTION_COOLDOWN
+                if elapsed < cooldown:
+                    print(f"   [COOLDOWN BLOCKED] distraction={distraction_type!r}, elapsed={elapsed:.1f}s < cooldown={cooldown}s (last={last_alert_distraction_type!r})")
+                    return False
+            
             alert_active = True
-            video_timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
         print(f"[ALERT] Fired at video_time={video_timestamp:.3f}s  [warning_type={warning_type!r}]")
 
@@ -381,28 +430,29 @@ def run_pipeline(video_path=None):
 
         last_detection_result = result              
 
-        new_state = {
-            "left": result["left_hand_on"],
-            "right": result["right_hand_on"]
-        }
-
-        # ── Debounce logic ──
-        if new_state == confirmed_hand_state:
-            pending_hand_state = None
-            pending_count = 0
-        elif new_state == pending_hand_state:
-            pending_count += 1
-            if pending_count >= DEBOUNCE_THRESHOLD:
-                print(f"State change confirmed: {confirmed_hand_state} → {new_state}")
-                confirmed_hand_state = new_state
-                pending_hand_state = None
-                pending_count = 0
-        else:
-            pending_hand_state = new_state
-            pending_count = 1
+        # ── Debounce logic (independent Left and Right hand checks) ──
+        for side in ["left", "right"]:
+            is_detected_on = result[f"{side}_hand_on"]
+            if is_detected_on:
+                hand_on_frames[side] += 1
+                hand_off_frames[side] = 0
+                if hand_on_frames[side] >= DEBOUNCE_ON_FRAMES:
+                    confirmed_hand_state[side] = True
+            else:
+                hand_off_frames[side] += 1
+                hand_on_frames[side] = 0
+                if hand_off_frames[side] >= DEBOUNCE_OFF_FRAMES:
+                    confirmed_hand_state[side] = False
 
         # ── Use confirmed_hand_state for alert logic ──
         hands_on_wheel = confirmed_hand_state["left"] and confirmed_hand_state["right"]
+
+        # Check if there is an active warning-worthy action recently detected (in the last 2.0 seconds)
+        recent_action_active = (
+            last_predicted_action is not None 
+            and (current_time - last_predicted_action_time) <= 2.0 
+            and get_action_warning_type(last_predicted_action) is not None
+        )
 
         if hands_on_wheel:
             hands_off_since = None
@@ -411,31 +461,33 @@ def run_pipeline(video_path=None):
                 hands_off_since = current_time
 
             hands_off_duration = current_time - hands_off_since
-            # Print status periodically rather than every single frame to avoid spam
             if frame_count % 15 == 0:
-                print(f"Hands off wheel for {hands_off_duration:.1f}s")
+                print(f"Hands off wheel for {hands_off_duration:.1f}s (action_active={recent_action_active})")
 
-            if hands_off_duration >= HANDS_OFF_THRESHOLD and (
-            (confirmed_hand_state["left"] == False and confirmed_hand_state["right"] == True) or
-            (confirmed_hand_state["left"] == True  and confirmed_hand_state["right"] == False)):
-                alert_was_fired = trigger_alert(
-                    {"distracted": "yes", "distraction_type": "one hand off wheel"},
-                    warning_type="light"
-                )
-                hands_off_since = current_time
+            # Only trigger hands-off alerts if no warning-worthy action is active
+            if not recent_action_active:
+                left_off = not confirmed_hand_state["left"]
+                right_off = not confirmed_hand_state["right"]
 
-                if alert_was_fired:
-                    print("[ALERT] Started - Blocking new triggers until voice finishes.")
+                # One hand off wheel warning
+                if left_off != right_off and hands_off_duration >= HANDS_OFF_ONE_HAND_THRESHOLD:
+                    alert_was_fired = trigger_alert(
+                        {"distracted": "yes", "distraction_type": "one hand off wheel"},
+                        warning_type="light"
+                    )
+                    hands_off_since = current_time
+                    if alert_was_fired:
+                        print("[ALERT] Fired one hand off wheel - Blocking triggers until voice finishes.")
 
-            if hands_off_duration >= HANDS_OFF_THRESHOLD and confirmed_hand_state["left"] == False and confirmed_hand_state["right"] == False:
-                alert_was_fired = trigger_alert(
-                    {"distracted": "yes", "distraction_type": "both hands off wheel"},
-                    warning_type="heavy"
-                )
-                hands_off_since = current_time
-
-                if alert_was_fired:
-                    print("[ALERT] Started - Blocking new triggers until voice finishes.")
+                # Both hands off wheel warning
+                elif left_off and right_off and hands_off_duration >= HANDS_OFF_BOTH_HANDS_THRESHOLD:
+                    alert_was_fired = trigger_alert(
+                        {"distracted": "yes", "distraction_type": "both hands off wheel"},
+                        warning_type="heavy"
+                    )
+                    hands_off_since = current_time
+                    if alert_was_fired:
+                        print("[ALERT] Fired both hands off wheel - Blocking triggers until voice finishes.")
 
         # ── 2. ACTION CLASSIFICATION ──
         frames_buffer.append(frame)
@@ -446,25 +498,48 @@ def run_pipeline(video_path=None):
                 frame_count - last_action_frame >= ACTION_OVERLAP):
 
             last_action_frame = frame_count
-            action = classify_action(frames_buffer)
+            action_result = classify_action(frames_buffer, action_worker)
 
-            if action:
-                predicted_class = action.get("predicted_class", "unknown")
-                confidence      = action.get("confidence", 0.0)
-                warning_type    = get_action_warning_type(predicted_class)
+            if action_result:
+                # Apply EMA smoothing to the raw action probabilities
+                raw_probs = action_result.get("probs")
+                if raw_probs and action_worker.recognizer:
+                    if smoothed_probs is None:
+                        smoothed_probs = list(raw_probs)
+                    else:
+                        smoothed_probs = [
+                            ema_alpha * curr + (1.0 - ema_alpha) * smooth
+                            for curr, smooth in zip(raw_probs, smoothed_probs)
+                        ]
+
+                    # Determine the smoothed action and confidence (pure Python argmax)
+                    max_idx = smoothed_probs.index(max(smoothed_probs))
+                    id2label = action_worker.recognizer.id2label
+                    smoothed_action = id2label[max_idx]
+                    smoothed_confidence = smoothed_probs[max_idx]
+                else:
+                    smoothed_action = action_result.get("predicted_class", "unknown")
+                    smoothed_confidence = action_result.get("confidence", 0.0)
+
+                # Track predicted action and its timestamp
+                if smoothed_confidence >= ACTION_CONFIDENCE_THRESHOLD:
+                    last_predicted_action = smoothed_action
+                    last_predicted_action_time = current_time
+
+                warning_type    = get_action_warning_type(smoothed_action)
 
                 if warning_type is None:  # safe_driving — no alert
-                    print(f"[OK] Safe driving detected (conf={confidence:.2f}) — no alert.")
+                    print(f"[OK] Safe driving detected (conf={smoothed_confidence:.2f}) — no alert.")
                 else:
                     print(
-                        f"[WARN] Action detected: '{predicted_class}' "
-                        f"(conf={confidence:.2f}, warning_type={warning_type!r})"
+                        f"[WARN] Action detected: '{smoothed_action}' "
+                        f"(conf={smoothed_confidence:.2f}, warning_type={warning_type!r})"
                     )
                     trigger_alert(
-                        {"distracted": "yes", "distraction_type": predicted_class},
+                        {"distracted": "yes", "distraction_type": smoothed_action},
                         warning_type=warning_type
                     )
-                    last_status_text.append((f"⚠ {predicted_class.upper()}", (0, 165, 255)))
+                    last_status_text.append((f"⚠ {smoothed_action.upper()}", (0, 165, 255)))
 
         # ── 3. COMPOSE OUTPUT FRAME ──
         # Re-draw landmarks on the current fresh frame every iteration to avoid stale overlays
@@ -517,6 +592,9 @@ def run_pipeline(video_path=None):
         print(f"[OK] Silent annotated video saved to: {silent_output_path}")
 
     cv2.destroyAllWindows()
+
+    # Stop action recognition worker
+    action_worker.stop()
 
     # ── 4. WAIT FOR IN-FLIGHT ALERT THREADS (up to 15 s) ──
     if video_path:

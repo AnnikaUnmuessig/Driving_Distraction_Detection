@@ -15,6 +15,7 @@ export function WebcamSource() {
   const [wsUrl, setWsUrl] = useState<string | null>(null);
   const [mediapipeOn, setMediapipeOn] = useState(true);
   const [videomaeOn, setVideomaeOn] = useState(true);
+  const [audioOn, setAudioOn] = useState(true);
   const [actionInterval, setActionInterval] = useState(1.0);
 
   const { status, frameUrl, alerts, handState, latestVoiceAlert, connect, disconnect, sendMessage } = useVideoStream(wsUrl);
@@ -24,6 +25,7 @@ export function WebcamSource() {
   const handleStart = () => {
     setMediapipeOn(true);
     setVideomaeOn(true);
+    setAudioOn(true);
     setActionInterval(1.0);
     const url = `${API_WS}/stream/webcam?cam_index=${camIndex}`;
     setWsUrl(url);
@@ -46,6 +48,12 @@ export function WebcamSource() {
     sendMessage({ type: "toggle", target: "videomae", enabled: next });
   };
 
+  const toggleAudio = () => {
+    const next = !audioOn;
+    setAudioOn(next);
+    sendMessage({ type: "toggle", target: "audio", enabled: next });
+  };
+
   return (
     <VideoPanel label="live webcam" frameUrl={frameUrl} alerts={alerts} status={status}
       latestVoiceAlert={latestVoiceAlert}
@@ -57,6 +65,7 @@ export function WebcamSource() {
           <>
             <ToggleButton label="MediaPipe" on={mediapipeOn} disabled={status !== "streaming"} onClick={toggleMediapipe} />
             <ToggleButton label="VideoMAE" on={videomaeOn} disabled={status !== "streaming"} onClick={toggleVideomae} />
+            <ToggleButton label="Voice Alerts" on={audioOn} disabled={status !== "streaming"} onClick={toggleAudio} />
             <select
               value={actionInterval}
               onChange={(e) => {
