@@ -162,7 +162,7 @@ def detect_steering_and_hands(frame_or_path, steering_box=None):
             elif hand["label"] == "Right": right_on = True
 
     POSE_WRIST_INDICES = {"Left": 15, "Right": 16}
-    POSE_VISIBILITY_THRESHOLD = 0.4
+    POSE_VISIBILITY_THRESHOLD = 0.6
 
     if steering_box and pose_result.pose_landmarks:
         lms = pose_result.pose_landmarks[0]
@@ -177,7 +177,11 @@ def detect_steering_and_hands(frame_or_path, steering_box=None):
 
             wrist_lm = lms[POSE_WRIST_INDICES[side]]
             if wrist_lm.visibility < POSE_VISIBILITY_THRESHOLD:
-                print(f"[Fallback] {side} wrist pose landmark not visible enough, skipping.")
+                print(f"[Fallback] {side} wrist cannot be detected (visibility: {wrist_lm.visibility:.3f}), treated as out of box.")
+                if side == "Left":
+                    left_on = False
+                else:
+                    right_on = False
                 continue
 
             wrist_px = wrist_lm.x * img_w

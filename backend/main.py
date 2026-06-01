@@ -385,16 +385,11 @@ class DetectionState:
             if self.last_alert_distraction_type is not None:
                 cooldown = self.same_action_cooldown if distraction_type == self.last_alert_distraction_type else self.diff_action_cooldown
                 
-                logical_elapsed = logical_time - self.last_alert_finished_logical_time
-                if logical_elapsed < cooldown:
-                    print(f"   [COOLDOWN BLOCKED LOGICAL] distraction={distraction_type!r}, logical_elapsed={logical_elapsed:.2f}s < cooldown={cooldown}s")
+                # Use real wall-clock time for cooldown checks (logical_time can stall between frames)
+                real_elapsed = real_time - self.last_alert_finished_real_time
+                if real_elapsed < cooldown:
+                    print(f"   [COOLDOWN BLOCKED] distraction={distraction_type!r}, real_elapsed={real_elapsed:.2f}s < cooldown={cooldown}s")
                     return False
-                
-                if self.play_audio:
-                    real_elapsed = real_time - self.last_alert_finished_real_time
-                    if real_elapsed < cooldown:
-                        print(f"   [COOLDOWN BLOCKED REAL] distraction={distraction_type!r}, real_elapsed={real_elapsed:.2f}s < cooldown={cooldown}s")
-                        return False
             
             if self.play_audio:
                 with self.audio_playing_lock:
@@ -403,7 +398,7 @@ class DetectionState:
                         return False
                     self.audio_playing = True
 
-            self.last_alert_finished_logical_time = logical_time + 3.0
+            self.last_alert_finished_logical_time = logical_time
             self.last_alert_finished_real_time = real_time + 3.0
             self.last_alert_distraction_type = distraction_type
             self.active_alert_threads += 1
