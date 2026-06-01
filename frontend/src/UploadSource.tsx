@@ -1,3 +1,8 @@
+/**
+ * UploadSource component handles uploading video files, rendering execution controls,
+ * and displaying the processed video with visual/audio safety overlays.
+ */
+
 import React, { useRef, useState } from "react";
 import { VideoPanel } from "./VideoPanel";
 import { useUploadJob } from "./useUploadJob";
@@ -6,12 +11,16 @@ import { useVideoStream } from "./useVideoStream";
 const API_WS = "ws://localhost:8000";
 const API = "http://localhost:8000";
 
+/**
+ * Main component for video upload and pipeline controls.
+ */
 export function UploadSource() {
   const { job, uploadProgress, upload, reset } = useUploadJob();
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const [mediapipeOn, setMediapipeOn] = useState(true);
   const [videomaeOn, setVideomaeOn] = useState(true);
+  const [voiceOn, setVoiceOn] = useState(true);
   const [isPaused, setIsPaused] = useState(false);
   const [actionInterval, setActionInterval] = useState(1.0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -36,8 +45,9 @@ export function UploadSource() {
     setIsPaused(false);
     setMediapipeOn(true);
     setVideomaeOn(true);
+    setVoiceOn(true);
     setActionInterval(1.0);
-    await upload(file); // Upload first, get job_id - WebSocket will connect automatically
+    await upload(file);
   };
 
   const handleReset = () => {
@@ -47,6 +57,7 @@ export function UploadSource() {
     setIsPaused(false);
     setMediapipeOn(true);
     setVideomaeOn(true);
+    setVoiceOn(true);
     setActionInterval(1.0);
   };
 
@@ -67,7 +78,6 @@ export function UploadSource() {
       progress={job?.progress}
       latestVoiceAlert={latestVoiceAlert}
     >
-      {/* ── controls slot ── */}
       <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
         {isRunning && (
           <>
@@ -80,6 +90,11 @@ export function UploadSource() {
               const next = !videomaeOn;
               setVideomaeOn(next);
               sendMessage({ type: "toggle", target: "videomae", enabled: next });
+            }} />
+            <ToggleButton label="Voice" on={voiceOn} disabled={streamStatus !== "streaming"} onClick={() => {
+              const next = !voiceOn;
+              setVoiceOn(next);
+              sendMessage({ type: "toggle", target: "audio", enabled: next });
             }} />
             <select
               value={actionInterval}
@@ -110,10 +125,8 @@ export function UploadSource() {
                 video.style.borderRadius = '6px';
                 video.style.marginTop = '16px';
 
-                // Replace the current content with the video
                 const container = document.querySelector('[data-upload-container]');
                 if (container) {
-                  // Clear existing video if any
                   const existingVideo = container.querySelector('video');
                   if (existingVideo) {
                     existingVideo.remove();
@@ -153,8 +166,6 @@ export function UploadSource() {
         )}
       </div>
 
-      {/* ── drop zone (shown below VideoPanel via children ordering trick — rendered here as a sibling) ── */}
-      {/* We render extra UI after the VideoPanel by using a wrapper */}
       <ExtraUI
         file={file} job={job} isRunning={!!isRunning} isDone={!!isDone}
         dragging={dragging} uploadProgress={uploadProgress}
@@ -171,15 +182,15 @@ export function UploadSource() {
   );
 }
 
-// Extra UI rendered as children of VideoPanel's "children" slot wraps the controls row,
-// but we also need the drop zone below the video. We pass it all as a fragment.
+/**
+ * Handles presentation of the file dropzone, details, upload progress, and stats.
+ */
 function ExtraUI({
   file, job, isRunning, isDone, dragging, uploadProgress,
   inputRef, onDragOver, onDragLeave, onDrop, onFileChange, onBrowseClick, onStart,
 }: any) {
   return (
     <>
-      {/* drop zone */}
       {!file && (
         <div
           onDragOver={onDragOver}
@@ -209,7 +220,6 @@ function ExtraUI({
         </div>
       )}
 
-      {/* file loaded row */}
       {file && !isRunning && !isDone && (
         <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8,
           background: "rgba(255,255,255,0.04)", borderRadius: 5,
@@ -226,12 +236,10 @@ function ExtraUI({
         </div>
       )}
 
-      {/* upload progress */}
       {job?.status === "queued" && uploadProgress < 100 && (
         <MiniProgress label="UPLOADING" value={uploadProgress} color="#3b82f6" />
       )}
 
-      {/* done stats */}
       {isDone && (
         <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
           <StatChip label="ALERTS" value={String(job.alert_count)} />
@@ -242,6 +250,9 @@ function ExtraUI({
   );
 }
 
+/**
+ * Renders a small progress bar indicator.
+ */
 function MiniProgress({ label, value, color }: { label: string; value: number; color: string }) {
   return (
     <div style={{ marginTop: 8 }}>
@@ -257,6 +268,9 @@ function MiniProgress({ label, value, color }: { label: string; value: number; c
   );
 }
 
+/**
+ * Renders a key-value statistical information chip.
+ */
 function StatChip({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
     <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: 4,
@@ -267,6 +281,9 @@ function StatChip({ label, value, color }: { label: string; value: string; color
   );
 }
 
+/**
+ * Reusable toggle button component for toggling features.
+ */
 function ToggleButton({ label, on, disabled, onClick }: { label: string; on: boolean; disabled?: boolean; onClick: () => void }) {
   return (
     <button

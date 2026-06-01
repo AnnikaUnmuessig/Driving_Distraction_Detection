@@ -1,4 +1,8 @@
-# This is the final pipeline
+"""
+This module contains the main driving distraction detection pipeline, orchestrating
+steering wheel detection, hand tracking, action recognition, and audio warning feedback.
+"""
+
 import cv2
 import time
 import threading
@@ -9,48 +13,38 @@ from Steering_wheel_detector import detect_steering_and_hands, draw_landmarks_on
 from Feedback import generate_safety_alert_all_groq
 from action_recognition import ActionRecognizer
 
-# Fixed variables
-HANDS_OFF_THRESHOLD = 1        # seconds temporarily low
-WHEEL_DETECTION_INTERVAL = 1   # seconds
-VIDEOMAE_WINDOW_SIZE = 16      # number of frames for action classification
-ACTION_OVERLAP = 30             # start new action classification every 30 frames
-DEBOUNCE_THRESHOLD = 3         # number of consecutive detections to confirm state change
-ACTION_CONFIDENCE_THRESHOLD = 0.5  # confidence threshold for action alerts
-EMA_ALPHA = 1.0                # Deprecated, no longer used
+HANDS_OFF_THRESHOLD = 1
+WHEEL_DETECTION_INTERVAL = 1
+VIDEOMAE_WINDOW_SIZE = 16
+ACTION_OVERLAP = 30
+DEBOUNCE_THRESHOLD = 3
+ACTION_CONFIDENCE_THRESHOLD = 0.5
+EMA_ALPHA = 1.0
 
-# ── Warning severity per action class ──────────────────────────────────────
-# Maps model class label strings → warning_type passed to the LLM.
-# 'safe_driving' is intentionally omitted — no alert is fired for it.
 ACTION_WARNING_MAP: dict[str, str] = {
-    # ── High risk — phone / texting ───────────────────────────────────────
     "texting_right"  : "heavy",
     "texting_left"   : "heavy",
     "phonecall_right": "heavy",
     "phonecall_left" : "heavy",
-    # ── Medium risk — hands / eyes away from wheel ───────────────────────
     "drinking"       : "light-mid",
     "reach_side"     : "light-mid",
     "hair_and_makeup": "light-mid",
-    # ── Low risk — brief / momentary distraction ────────────────────────
     "radio"          : "light",
 }
 
 def get_action_warning_type(predicted_class: str) -> str:
-    """Return the warning severity for a given model class label.
-
-    Returns None for 'safe_driving' so the caller can skip the alert entirely.
-    Falls back to 'moderate' for any class not listed in ACTION_WARNING_MAP.
-    """
-    if predicted_class == "safe_driving" or predicted_class== "change_gear":
-        return None  # no alert for safe behaviour
+    """Returns the warning severity for a given action class."""
+    if predicted_class == "safe_driving" or predicted_class == "change_gear":
+        return None
     return ACTION_WARNING_MAP.get(predicted_class, "moderate")
 
 
 class ActionRecognitionWorker:
-    """Background thread worker for action recognition inference"""
+    """Background worker for action recognition inference."""
     
     def __init__(self):
-        self.queue = queue.Queue(maxsize=1)  # buffer up to 1 frame set
+        """Initializes the background worker and queue."""
+        self.queue = queue.Queue(maxsize=1)
         self.latest_result = None
         self.result_lock = threading.Lock()
         self.running = False
@@ -59,7 +53,7 @@ class ActionRecognitionWorker:
         self.result_id = 0
         
     def start(self):
-        """Initialize model and start worker thread"""
+        """Initializes the recognizer and starts the worker loop thread."""
         try:
             self.recognizer = ActionRecognizer()
             self.running = True
@@ -71,11 +65,11 @@ class ActionRecognitionWorker:
             self.running = False
     
     def _worker_loop(self):
-        """Continuous loop consuming frame buffers"""
+        """Processes queued frame buffers to run action predictions."""
         while self.running:
             try:
                 item = self.queue.get(timeout=1)
-                if item is None:  # shutdown signal
+                if item is None:
                     break
                 frames_buffer = item
                     
@@ -92,19 +86,19 @@ class ActionRecognitionWorker:
                 print(f"[ERROR] Action recognition error: {e}")
     
     def queue_frames(self, frames: list):
-        """Non-blocking push of frame buffer to queue"""
+        """Adds a copy of frames to the worker queue."""
         try:
             self.queue.put_nowait(frames)
         except queue.Full:
-            pass  # silently skip if queue full
+            pass
     
     def get_result(self):
-        """Retrieve latest action result (non-blocking)"""
+        """Gets the latest prediction result."""
         with self.result_lock:
             return self.latest_result
     
     def stop(self):
-        """Gracefully shutdown"""
+        """Stops the background worker thread."""
         self.running = False
         try:
             self.queue.put(None, block=False)
@@ -113,11 +107,7 @@ class ActionRecognitionWorker:
 
 
 def classify_action(frames_buffer, action_worker=None):
-    """
-    Wrapper for action classification.
-    If action_worker is provided, queues frames and returns previous result.
-    Otherwise returns None (backward compatible).
-    """
+    """Queues frames for classification and returns the latest prediction."""
     if action_worker is None:
         return None
     
@@ -126,35 +116,24 @@ def classify_action(frames_buffer, action_worker=None):
 
 
 def build_audio_track(alert_log, total_duration_seconds):
-    """
-    Mixes all in-memory audio clips into a single raw PCM stream using FFmpeg.
-    Each clip is delayed to its alert timestamp, then all are amixed together.
-    The result is trimmed to total_duration_seconds so audio never outlasts the video.
-
-    alert_log : list of (video_timestamp_seconds: float, audio_bytes: bytes)
-                audio_bytes must be a valid encoded audio file (e.g. MP3 from Groq TTS)
-    Returns   : raw PCM bytes (s16le, 44100 Hz, stereo) or None on failure
-    """
+    """Mixes multiple audio clips at their respective timestamps into a single PCM stream."""
     if not alert_log:
         return None
 
     import tempfile
     
-    # ── DEBUG: print all alert timestamps ──
     print(f"\n[DEBUG] {len(alert_log)} alert(s) queued for mixing:")
     for i, (ts, audio_bytes) in enumerate(alert_log):
         print(f"   Alert {i+1}: timestamp={ts:.3f}s, size={len(audio_bytes):,} bytes")
 
     temp_files = []
     try:
-        # 1. Write all alert audio bytes to temporary files
         for i, (ts, audio_bytes) in enumerate(alert_log):
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.write(audio_bytes)
             tmp.close()
             temp_files.append(tmp.name)
 
-        # 2. Build FFmpeg command
         cmd = ["ffmpeg", "-y"]
         for path in temp_files:
             cmd += ["-i", path]
@@ -172,14 +151,13 @@ def build_audio_track(alert_log, total_duration_seconds):
         cmd += [
             "-filter_complex", ";".join(filter_parts),
             "-map", "[aout]",
-            "-t", str(total_duration_seconds),  # hard trim to video length
+            "-t", str(total_duration_seconds),
             "-ar", "44100",
             "-ac", "2",
-            "-f", "s16le",                      # raw PCM — no container overhead
+            "-f", "s16le",
             "pipe:1"
         ]
 
-        # 3. Run FFmpeg
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -199,7 +177,6 @@ def build_audio_track(alert_log, total_duration_seconds):
         print(f"[ERROR] build_audio_track exception: {e}")
         return None
     finally:
-        # 4. Clean up temporary files
         for path in temp_files:
             try:
                 if os.path.exists(path):
@@ -209,7 +186,7 @@ def build_audio_track(alert_log, total_duration_seconds):
 
 
 def _convert_to_h264(input_path, output_path):
-    """Re-encodes a video file to browser-compatible H.264 using FFmpeg."""
+    """Converts a video to browser-compatible H.264 format using FFmpeg."""
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
@@ -231,22 +208,19 @@ def _convert_to_h264(input_path, output_path):
 
 
 def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_duration_seconds):
-    """
-    Pipes raw PCM bytes into FFmpeg as the audio stream and muxes with the silent video.
-    Audio is hard-trimmed to total_duration_seconds. Video is re-encoded to H.264.
-    """
+    """Muxes PCM audio into the video and encodes to H.264 using FFmpeg."""
     cmd = [
         "ffmpeg", "-y",
-        "-i", silent_video_path,    # video from file
-        "-f", "s16le",              # raw PCM from stdin
+        "-i", silent_video_path,
+        "-f", "s16le",
         "-ar", "44100",
         "-ac", "2",
         "-i", "pipe:0",
         "-map", "0:v",
         "-map", "1:a",
         "-vf", "yadif",
-        "-c:v", "libx264",          # re-encode to H.264 for browser compatibility
-        "-pix_fmt", "yuv420p",      # standard pixel format for web playback
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-t", str(total_duration_seconds),
         "-shortest",
@@ -263,6 +237,7 @@ def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_
 
 
 def run_pipeline(video_path=None):
+    """Runs the full steering wheel detection and action recognition pipeline on video or webcam."""
     cap = cv2.VideoCapture(video_path if video_path else 0)
     if not cap.isOpened():
         print("Error: Could not open video source.")
@@ -272,7 +247,6 @@ def run_pipeline(video_path=None):
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # VideoWriter — silent for now; audio is muxed in at the end
     out = None
     silent_output_path = None
     if video_path:
@@ -281,11 +255,9 @@ def run_pipeline(video_path=None):
         out = cv2.VideoWriter(silent_output_path, fourcc, fps, (frame_w, frame_h))
         print(f"Saving annotated video (silent) to: {silent_output_path}")
 
-    # In-memory alert log: list of (video_timestamp_seconds, audio_bytes)
     alert_log = []
     alert_log_lock = threading.Lock()
 
-    # State tracking
     hands_off_since = None
     last_roboflow_time = 0
     cached_steering_box = None
@@ -295,12 +267,10 @@ def run_pipeline(video_path=None):
     last_detection_result = None
     last_status_text = []
 
-    # Debounce state
     confirmed_hand_state = {"left": True, "right": True}
     pending_hand_state = None
     pending_count = 0
 
-    # Alert threading state
     alert_lock = threading.Lock()
     alert_active = False
 
@@ -325,14 +295,6 @@ def run_pipeline(video_path=None):
                 alert_active = False
 
     def trigger_alert(distraction_output, warning_type: str = "moderate"):
-        """Fire an audio alert in a background thread.
-
-        Args:
-            distraction_output: dict describing what the driver is doing
-                                (keys: 'distracted', 'distraction_type').
-            warning_type: severity of the alert sent to the LLM/TTS pipeline
-                          (e.g. 'light', 'light-mid', 'heavy').
-        """
         nonlocal alert_active
 
         with alert_lock:
@@ -360,13 +322,11 @@ def run_pipeline(video_path=None):
         current_time = time.time()
         frame_count += 1
 
-        # ── 1. STEERING WHEEL + HAND DETECTION ──
         run_roboflow = False
         if current_time - last_roboflow_time >= 30.0 or cached_steering_box is None:
             run_roboflow = True
             last_roboflow_time = current_time
 
-        # Run MediaPipe on every frame, passing the cached box if Roboflow is skipped
         result = detect_steering_and_hands(frame, steering_box=None if run_roboflow else cached_steering_box)
 
         if run_roboflow:
@@ -386,7 +346,6 @@ def run_pipeline(video_path=None):
             "right": result["right_hand_on"]
         }
 
-        # ── Debounce logic ──
         if new_state == confirmed_hand_state:
             pending_hand_state = None
             pending_count = 0
@@ -401,7 +360,6 @@ def run_pipeline(video_path=None):
             pending_hand_state = new_state
             pending_count = 1
 
-        # ── Use confirmed_hand_state for alert logic ──
         hands_on_wheel = confirmed_hand_state["left"] and confirmed_hand_state["right"]
 
         if hands_on_wheel:
@@ -411,7 +369,6 @@ def run_pipeline(video_path=None):
                 hands_off_since = current_time
 
             hands_off_duration = current_time - hands_off_since
-            # Print status periodically rather than every single frame to avoid spam
             if frame_count % 15 == 0:
                 print(f"Hands off wheel for {hands_off_duration:.1f}s")
 
@@ -437,7 +394,6 @@ def run_pipeline(video_path=None):
                 if alert_was_fired:
                     print("[ALERT] Started - Blocking new triggers until voice finishes.")
 
-        # ── 2. ACTION CLASSIFICATION ──
         frames_buffer.append(frame)
         if len(frames_buffer) > VIDEOMAE_WINDOW_SIZE:
             frames_buffer.pop(0)
@@ -453,7 +409,7 @@ def run_pipeline(video_path=None):
                 confidence      = action.get("confidence", 0.0)
                 warning_type    = get_action_warning_type(predicted_class)
 
-                if warning_type is None:  # safe_driving — no alert
+                if warning_type is None:
                     print(f"[OK] Safe driving detected (conf={confidence:.2f}) — no alert.")
                 else:
                     print(
@@ -466,8 +422,6 @@ def run_pipeline(video_path=None):
                     )
                     last_status_text.append((f"⚠ {predicted_class.upper()}", (0, 165, 255)))
 
-        # ── 3. COMPOSE OUTPUT FRAME ──
-        # Re-draw landmarks on the current fresh frame every iteration to avoid stale overlays
         if last_detection_result is not None:
             mp_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             output_frame = draw_landmarks_on_image(mp_frame, last_detection_result["hand_result"])
@@ -518,7 +472,6 @@ def run_pipeline(video_path=None):
 
     cv2.destroyAllWindows()
 
-    # ── 4. WAIT FOR IN-FLIGHT ALERT THREADS (up to 15 s) ──
     if video_path:
         print("[INFO] Waiting for alert audio threads to finish...")
         deadline = time.time() + 15
@@ -529,7 +482,6 @@ def run_pipeline(video_path=None):
                 break
             time.sleep(0.2)
 
-    # ── 5. MIX ALL AUDIO IN MEMORY, THEN MUX INTO FINAL VIDEO ──
     if video_path and silent_output_path:
         final_output_path = video_path.rsplit(".", 1)[0] + "_final.mp4"
 
@@ -552,7 +504,6 @@ def run_pipeline(video_path=None):
             print("[INFO] No alerts fired — encoding video to H.264 without audio.")
             _convert_to_h264(silent_output_path, final_output_path)
 
-        # Clean up intermediate silent file
         if os.path.exists(final_output_path) and os.path.exists(silent_output_path):
             os.remove(silent_output_path)
 

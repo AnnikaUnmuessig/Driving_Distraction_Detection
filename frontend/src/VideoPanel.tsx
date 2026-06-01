@@ -1,3 +1,8 @@
+/**
+ * VideoPanel component renders the video player frame, controls slot, and overlay elements,
+ * such as alerts, debounce bars, and the voice alert banner.
+ */
+
 import React from "react";
 import type { AlertEvent } from "./useVideoStream";
 
@@ -27,6 +32,9 @@ const SEV_COLORS: Record<string, { bg: string; fg: string; dot: string }> = {
   "light":     { bg: "rgba(59, 130, 246, 0.18)", fg: "#93c5fd", dot: "#3b82f6" },
 };
 
+/**
+ * Main component representing the video player and detection details panel.
+ */
 export function VideoPanel({
   label, frameUrl, alerts, status, progress,
   confirmedHandState, pendingCount = 0, debounceThreshold = 3,
@@ -37,7 +45,6 @@ export function VideoPanel({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10, height: "100%" }}>
-      {/* ── header row ── */}
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <StatusDot status={status} />
         <span style={{ fontFamily: "'JetBrains Mono', 'Fira Code', monospace", fontSize: 11,
@@ -50,7 +57,6 @@ export function VideoPanel({
         </div>
       </div>
 
-      {/* ── video frame ── */}
       <div style={{
         background: "#050508",
         borderRadius: 6,
@@ -68,9 +74,6 @@ export function VideoPanel({
           <EmptyState status={status} />
         )}
 
-
-
-        {/* Floating Voice Alert Banner */}
         {latestVoiceAlert && (() => {
           const sev = SEV_COLORS[latestVoiceAlert.severity] || { fg: "#c084fc", dot: "#a78bfa" };
           const reasonLabel =
@@ -81,7 +84,7 @@ export function VideoPanel({
                 : undefined;
           const actionLabel =
             latestVoiceAlert.triggerSource === "action" && latestVoiceAlert.distractionType
-              ? latestVoiceAlert.distractionType.replaceAll("_", " ")
+              ? latestVoiceAlert.distractionType.replace(/_/g, " ")
               : undefined;
           return (
             <div style={{
@@ -142,17 +145,14 @@ export function VideoPanel({
           );
         })()}
 
-        {/* corner brackets */}
         {["tl","tr","bl","br"].map(c => <CornerBracket key={c} corner={c as any} />)}
       </div>
 
-      {/* ── debounce state bars ── */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
         <DebounceBar label="LEFT" on={left} pending={pendingCount} threshold={debounceThreshold} />
         <DebounceBar label="RIGHT" on={right} pending={pendingCount} threshold={debounceThreshold} />
       </div>
 
-      {/* ── processing progress ── */}
       {status === "processing" && progress !== undefined && (
         <div>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
@@ -167,7 +167,6 @@ export function VideoPanel({
         </div>
       )}
 
-      {/* ── alert log ── */}
       <div style={{ fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
         fontSize: 10, display: "flex", flexDirection: "column", gap: 3,
         maxHeight: 140, overflowY: "auto", flex: 1 }}>
@@ -212,6 +211,9 @@ export function VideoPanel({
   );
 }
 
+/**
+ * Renders a debounce progress bar for left or right hands.
+ */
 function DebounceBar({ label, on, pending, threshold }:
   { label: string; on: boolean; pending: number; threshold: number }) {
   const fill = on ? threshold : pending;
@@ -238,6 +240,9 @@ function DebounceBar({ label, on, pending, threshold }:
   );
 }
 
+/**
+ * Renders status indicator light.
+ */
 function StatusDot({ status }: { status: string }) {
   const colors: Record<string, string> = {
     streaming: "#22c55e", live: "#22c55e", processing: "#3b82f6",
@@ -251,6 +256,9 @@ function StatusDot({ status }: { status: string }) {
   );
 }
 
+/**
+ * Renders status text pill.
+ */
 function StatusPill({ status }: { status: string }) {
   const map: Record<string, { label: string; color: string }> = {
     idle:       { label: "IDLE",       color: "#555" },
@@ -271,6 +279,9 @@ function StatusPill({ status }: { status: string }) {
   );
 }
 
+/**
+ * Renders empty/waiting state message in player frame.
+ */
 function EmptyState({ status }: { status: string }) {
   const msgs: Record<string, string> = {
     idle: "waiting for source", connecting: "connecting…",
@@ -286,6 +297,9 @@ function EmptyState({ status }: { status: string }) {
   );
 }
 
+/**
+ * Renders a styling corner bracket.
+ */
 function CornerBracket({ corner }: { corner: "tl"|"tr"|"bl"|"br" }) {
   const size = 12;
   const t = corner.startsWith("t") ? 0 : undefined;
