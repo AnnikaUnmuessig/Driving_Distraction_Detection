@@ -159,7 +159,11 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
                 play_obj.wait_done()
                 print("Alert played successfully.")
             except Exception as playback_err:
-                print(f"Playback error: {playback_err}")
+                try:
+                    subprocess.run(["say", "-v", "Samantha", warning_text], check=True)
+                    print("Alert played via macOS say.")
+                except Exception as say_err:
+                    print(f"Playback error: {playback_err} | macOS say error: {say_err}")
 
         total_time = time.time() - start_time
         print(f"Total Alert Latency: {total_time:.3f}s")

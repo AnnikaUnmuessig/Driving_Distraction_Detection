@@ -30,12 +30,11 @@ from pipeline import (
     _convert_to_h264,
     ActionRecognitionWorker,
     ACTION_OVERLAP,
-    DEBOUNCE_THRESHOLD,
-    HANDS_OFF_THRESHOLD,
     VIDEOMAE_WINDOW_SIZE,
     WHEEL_DETECTION_INTERVAL,
     ACTION_CONFIDENCE_THRESHOLD,
     get_action_warning_type,
+    get_wav_duration,
 )
 
 def get_wav_duration(audio_bytes: bytes) -> float:
@@ -551,7 +550,7 @@ def _run_upload_pipeline(job_id: str, video_path: str):
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        state = DetectionState(fps=fps, play_audio=True)
+        state = DetectionState(fps=fps, play_audio=False)
         with jobs_lock:
             job["detection_state"] = state
 
