@@ -1,7 +1,26 @@
+"""
+This module handles driving distraction safety feedback.
+It generates safety warning text using Groq LLM and synthesizes it to speech.
+"""
+
 import os
 import shutil
+import time
+import subprocess
+import tempfile
+import wave
+import io
+import numpy as np
+from dotenv import load_dotenv
+from groq import Groq
+import simpleaudio as sa
+from pydub import AudioSegment
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(script_dir, ".env"))
 
 def _locate_and_add_ffmpeg_to_path():
+    """Locates the FFmpeg executable and adds its directory to the system PATH."""
     if shutil.which("ffmpeg") is not None:
         return
     if os.name == 'nt':
@@ -17,43 +36,21 @@ def _locate_and_add_ffmpeg_to_path():
 
 _locate_and_add_ffmpeg_to_path()
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from elevenlabs.client import ElevenLabs
-from elevenlabs import stream
-from huggingface_hub import login
-import torch
-import time
-import simpleaudio as sa
-import numpy as np
-import subprocess
-import tempfile
-import wave
-import io
-from pydub import AudioSegment
-from dotenv import load_dotenv
-from groq import Groq
-
-load_dotenv()
 print("GROQ_API_KEY found:", os.environ.get("GROQ_API_KEY") is not None)
-
 api_key = os.environ.get("GROQ_API_KEY")
 groq_client = Groq(api_key=api_key) if api_key else None
 
-
 def get_ffmpeg_cmd():
-    # Since we added FFmpeg to PATH, we can just use "ffmpeg" natively!
+    """Returns the name of the FFmpeg command."""
     return "ffmpeg"
 
-
-
-
-def generate_safety_alert_all_groq(distraction_output, warning_type: str = "moderate", play_audio=True):
+def generate_safety_alert_all_groq(distraction_output, warning_type: str = "moderate", play_audio=True, generate_audio=True):
+    """Generates a text alert using Groq LLM and converts it to audio using TTS, optionally playing it."""
     start_time = time.time()
     warning_text = None
     raw_audio_bytes = None
 
     action_map = {
-        # Action recognition classes
         "drinking": "drinking a beverage",
         "radio": "adjusting the radio",
         "hair_and_makeup": "fixing hair or makeup",
@@ -62,15 +59,12 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
         "phonecall_right": "making a phone call with their right hand",
         "phonecall_left": "making a phone call with their left hand",
         "reach_side": "reaching to the side",
-        
-        # Hand connection classes
         "one hand off wheel": "driving with only one hand on the wheel",
         "both hands off wheel": "driving with no hands on the steering wheel",
     }
     dtype_raw = distraction_output.get("distraction_type", "distraction")
     dtype_for_llm = action_map.get(dtype_raw, dtype_raw)
 
-    # 1. Groq LLM (text only)
     if groq_client:
         try:
             llm_response = groq_client.chat.completions.create(
@@ -99,34 +93,27 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
         except Exception as e:
             print(f"[WARN] Groq LLM failed: {e}")
 
-    # 2. pyttsx3 local TTS
-    if warning_text:
-        try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".aiff", delete=False)
-            tmp.close()
-            aiff_path = tmp.name
+    if warning_text and generate_audio:
+        if os.name != 'nt':
+            try:
+                tmp = tempfile.NamedTemporaryFile(suffix=".aiff", delete=False)
+                tmp.close()
+                aiff_path = tmp.name
 
-            subprocess.run(["say", "-v", "Samantha", "-o", aiff_path, warning_text], check=True)
+                subprocess.run(["say", "-v", "Samantha", "-o", aiff_path, warning_text], check=True)
 
-            if os.path.exists(aiff_path) and os.path.getsize(aiff_path) > 0:
-                audio_segment = AudioSegment.from_file(aiff_path, format="aiff")
-                wav_io = io.BytesIO()
-                audio_segment.export(wav_io, format="wav")
-                raw_audio_bytes = wav_io.getvalue()
-                print("[OK] macOS say TTS generated successfully.")
-            if os.path.exists(aiff_path):
-                os.remove(aiff_path)
-        except Exception as e:
-            print(f"[WARN] macOS say TTS failed: {e}")
+                if os.path.exists(aiff_path) and os.path.getsize(aiff_path) > 0:
+                    audio_segment = AudioSegment.from_file(aiff_path, format="aiff")
+                    wav_io = io.BytesIO()
+                    audio_segment.export(wav_io, format="wav")
+                    raw_audio_bytes = wav_io.getvalue()
+                    print("[OK] macOS say TTS generated successfully.")
+                if os.path.exists(aiff_path):
+                    os.remove(aiff_path)
+            except Exception as e:
+                print(f"[WARN] macOS say TTS failed: {e}")
 
-    # 3. Offline Fallback Logic
-    if not raw_audio_bytes:
-        dtype = distraction_output.get("distraction_type", "distraction").replace("_", " ").lower()
-        warning_text = warning_text or f"Warning: please stop {dtype} and focus on the road."
-        print(f"Assistant (Local): {warning_text}")
-
-        # Windows-native Speech Synthesizer fallback
-        if os.name == 'nt':
+        else:
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
             wav_path = tmp.name
@@ -142,7 +129,6 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
             except Exception as ps_err:
                 print(f"[ERROR] Offline Windows TTS failed: {ps_err}")
 
-        # Last resort: beep
         if not raw_audio_bytes:
             print("[INFO] Generating fallback alarm beep.")
             try:
@@ -165,15 +151,13 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
             except Exception as beep_err:
                 print(f"[ERROR] Failed to generate alarm beep: {beep_err}")
 
-    # 4. Playback and return
     if raw_audio_bytes:
         if play_audio:
             try:
-                import simpleaudio as sa
                 wave_obj = sa.WaveObject.from_wave_file(io.BytesIO(raw_audio_bytes))
                 play_obj = wave_obj.play()
                 play_obj.wait_done()
-                print("Alert played successfully via simpleaudio.")
+                print("Alert played successfully.")
             except Exception as playback_err:
                 try:
                     subprocess.run(["say", "-v", "Samantha", warning_text], check=True)
@@ -187,6 +171,3 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
     else:
         print("[ERROR] No alert audio generated.")
         return None, warning_text
-
-
-#generate_safety_alert_all_groq({'distraction_type': 'phone', 'severity': 'critical'})

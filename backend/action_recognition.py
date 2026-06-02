@@ -1,4 +1,4 @@
-# action_recognition.py
+"""Action recognition using VideoMAE."""
 import torch, cv2, numpy as np
 from pathlib import Path
 from PIL import Image
@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from dotenv import load_dotenv
 import os
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 NUM_FRAMES = 16
@@ -15,6 +15,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "video_mae"
 
 class ActionRecognizer:
+    """Classifier for driver action recognition."""
+
     def __init__(self):
         from huggingface_hub import login
         login(token=HF_TOKEN)
@@ -27,10 +29,7 @@ class ActionRecognizer:
 
     @torch.no_grad()
     def predict(self, frames: list, top_k: int = 3) -> dict:
-        """
-        frames: list of np.ndarray (BGR, uint8) — already sampled to NUM_FRAMES
-        Returns {"predicted_class": str, "confidence": float, "top_k": [...], "probs": [...]}
-        """
+        """Predict driver action from a list of frames."""
         pil_frames = [
             Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames
         ]

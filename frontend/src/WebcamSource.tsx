@@ -1,3 +1,8 @@
+/**
+ * WebcamSource component handles streaming the user's webcam feed to the backend
+ * and rendering the real-time detection overlays and controls.
+ */
+
 import React, { useState } from "react";
 import { VideoPanel } from "./VideoPanel";
 import { useVideoStream } from "./useVideoStream";
@@ -10,12 +15,15 @@ const CAMERAS = [
   { label: "Virtual cam (index 2)", index: 2 },
 ];
 
+/**
+ * Main component for live webcam processing and controls.
+ */
 export function WebcamSource() {
   const [camIndex, setCamIndex] = useState(0);
   const [wsUrl, setWsUrl] = useState<string | null>(null);
   const [mediapipeOn, setMediapipeOn] = useState(true);
   const [videomaeOn, setVideomaeOn] = useState(true);
-  const [audioOn, setAudioOn] = useState(true);
+  const [voiceOn, setVoiceOn] = useState(true);
   const [actionInterval, setActionInterval] = useState(1.0);
 
   const { status, frameUrl, alerts, handState, latestVoiceAlert, connect, disconnect, sendMessage } = useVideoStream(wsUrl);
@@ -25,7 +33,7 @@ export function WebcamSource() {
   const handleStart = () => {
     setMediapipeOn(true);
     setVideomaeOn(true);
-    setAudioOn(true);
+    setVoiceOn(true);
     setActionInterval(1.0);
     const url = `${API_WS}/stream/webcam?cam_index=${camIndex}`;
     setWsUrl(url);
@@ -48,9 +56,9 @@ export function WebcamSource() {
     sendMessage({ type: "toggle", target: "videomae", enabled: next });
   };
 
-  const toggleAudio = () => {
-    const next = !audioOn;
-    setAudioOn(next);
+  const toggleVoice = () => {
+    const next = !voiceOn;
+    setVoiceOn(next);
     sendMessage({ type: "toggle", target: "audio", enabled: next });
   };
 
@@ -65,7 +73,7 @@ export function WebcamSource() {
           <>
             <ToggleButton label="MediaPipe" on={mediapipeOn} disabled={status !== "streaming"} onClick={toggleMediapipe} />
             <ToggleButton label="VideoMAE" on={videomaeOn} disabled={status !== "streaming"} onClick={toggleVideomae} />
-            <ToggleButton label="Voice Alerts" on={audioOn} disabled={status !== "streaming"} onClick={toggleAudio} />
+            <ToggleButton label="Voice" on={voiceOn} disabled={status !== "streaming"} onClick={toggleVoice} />
             <select
               value={actionInterval}
               onChange={(e) => {
@@ -108,6 +116,9 @@ export function WebcamSource() {
   );
 }
 
+/**
+ * A button component used to toggle detection features.
+ */
 function ToggleButton({ label, on, disabled, onClick }: { label: string; on: boolean; disabled?: boolean; onClick: () => void }) {
   return (
     <button

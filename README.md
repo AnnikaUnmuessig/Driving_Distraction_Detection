@@ -12,9 +12,22 @@ browser (React + Vite)
                                                     cv2.VideoCapture(cam_index)
 ```
 
+### Detection Pipeline
+The backend uses a multi-modal approach for comprehensive distraction detection:
+
+- **Hand Detection**: MediaPipe HandLandmarker (2 hands, confidence ≥ 0.3)
+- **Steering Wheel Detection**: Roboflow steering wheel detector (confidence ≥ 0.4)
+- **Pose Fallback**: MediaPipe PoseLandmarker (wrist detection when hands not visible)
+- **Action Classification**: VideoMAE model for temporal action/distraction recognition
+- **Alert Generation**: LLM-powered voice alerts via Groq API
+
 ### Upload flow
 1. User drops a video file → `POST /upload` → backend saves file, spawns background thread
-2. Thread runs `DetectionState.process_frame()` on every frame, writes silent MP4
+2. Thread runs `DetectionState.process_frame()` on every frame:
+   - Detects hands on steering wheel (MediaPipe + fallback pose landmarks)
+   - Classifies driver actions using VideoMAE on temporal frame windows
+   - Triggers safety alerts for dangerous behaviors
+   - Writes annotated silent MP4
 3. After processing: waits for alert audio threads, calls `build_audio_track` + `mux_audio_into_video`
 4. Frontend polls `GET /jobs/{job_id}` every second for progress
 5. WS `/stream/upload/{job_id}` sends JPEG frames in real time during processing
@@ -32,6 +45,7 @@ browser (React + Vite)
 - **JSON messages**:
   ```json
   { "type": "alert", "distraction_type": "hands off wheel", "severity": "mid-heavy" }
+  { "type": "alert", "distraction_type": "texting", "severity": "heavy" }
   { "type": "done" }
   { "type": "error", "message": "Cannot open camera 0" }
   ```
@@ -46,12 +60,21 @@ cd backend
 # Install dependencies (add your existing packages too)
 pip install -r requirements.txt
 
+# Ensure models directory exists with required MediaPipe models:
+# - models/hand_landmarker.task
+# - models/pose_landmarker_lite.task
+# - models/pose_landmarker_heavy.task
+# - models/video_mae/config.json
+# - models/video_mae/model.safetensors
 
 # Copy your existing pipeline modules into backend/
 # Required: Steering_wheel_detector.py, Feedback.py, pipeline.py
 # pipeline.py must export: build_audio_track, classify_action, mux_audio_into_video,
 #   ACTION_OVERLAP, DEBOUNCE_THRESHOLD, HANDS_OFF_THRESHOLD,
-#   TIMESFORMER_WINDOW_SIZE, WHEEL_DETECTION_INTERVAL
+#   VIDEOMAE_WINDOW_SIZE, WHEEL_DETECTION_INTERVAL, ACTION_CONFIDENCE_THRESHOLD
+
+# Set environment variables (create backend/.env)
+echo "ROBOFLOW_API=your_api_key_here" > .env
 
 # Run
 uvicorn main:app --reload --port 8000
@@ -117,16 +140,27 @@ Extract the constants and helpers from your existing `pipeline.py` so they can b
 
 ```python
 # pipeline.py — make sure these are importable at module level
-HANDS_OFF_THRESHOLD = 1
-WHEEL_DETECTION_INTERVAL = 1
-TIMESFORMER_WINDOW_SIZE = 16
-ACTION_OVERLAP = 8
-DEBOUNCE_THRESHOLD = 3
+HANDS_OFF_THRESHOLD = 1              # Seconds before "hands off wheel" alert
+WHEEL_DETECTION_INTERVAL = 1         # Frames between steering wheel checks
+VIDEOMAE_WINDOW_SIZE = 16            # Frames per action classification window
+ACTION_OVERLAP = 8                   # Overlap between consecutive windows
+DEBOUNCE_THRESHOLD = 3               # Frames to debounce hand state changes
+ACTION_CONFIDENCE_THRESHOLD = 0.6    # Min confidence for action alerts
 
-def classify_action(frames_buffer): ...
-def build_audio_track(alert_log, total_duration_seconds): ...
-def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_duration_seconds): ...
+def classify_action(frames_buffer): 
+    """Classify driver action/distraction from frame buffer using VideoMAE."""
+    ...
+
+def build_audio_track(alert_log, total_duration_seconds): 
+    """Generate audio track from alert log."""
+    ...
+
+def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_duration_seconds): 
+    """Combine video with audio track."""
+    ...
+
+def get_action_warning_type(action):
+    """Return severity level ('light', 'mid', 'heavy') for action, or None if safe."""
+    ...
 ```
 
-Guard the `run_pipeline(...)` call at the bottom with `if __name__ == "__main__":` so it
-doesn't execute on import.

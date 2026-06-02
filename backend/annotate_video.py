@@ -48,7 +48,7 @@ from transformers import (
 import torch.nn.functional as F
 from PIL import Image
 
-# ── Default parameters (overridden by CLI args) ────────────────────────────────
+# Default parameters (overridden by CLI args) 
 DEFAULT_MODEL_CLASS = 'timesformer'   # 'timesformer' or 'videomae'
 DEFAULT_MODEL_DIR   = './timesformer_outputs/best_model'
 DEFAULT_INPUT       = ''              # path to input video
@@ -61,7 +61,7 @@ _FALLBACK = {
     'videomae':    'MCG-NJU/videomae-base-finetuned-kinetics',
 }
 
-# ── Overlay style ──────────────────────────────────────────────────────────────
+# Overlay style 
 BOX_ALPHA       = 0.55    # transparency of the label background box
 BOX_COLOR_BGR   = (20, 20, 20)
 TEXT_COLOR_BGR  = (255, 255, 255)
@@ -147,24 +147,24 @@ def draw_overlay(frame_bgr: np.ndarray, label: str, confidence: float, top3: lis
     h, w = frame_bgr.shape[:2]
     overlay = frame_bgr.copy()
 
-    # ── Background box ─────────────────────────────────────────────────────────
+    #Background box 
     box_h = 90
     cv2.rectangle(overlay, (0, h - box_h), (w, h), BOX_COLOR_BGR, -1)
     frame_out = cv2.addWeighted(overlay, BOX_ALPHA, frame_bgr, 1 - BOX_ALPHA, 0)
 
-    # ── Main label ─────────────────────────────────────────────────────────────
+    # Main label 
     label_text = label.replace('_', ' ').title()
     cv2.putText(frame_out, label_text,
                 (12, h - box_h + 30), FONT, FONT_SCALE,
                 TEXT_COLOR_BGR, FONT_THICKNESS, cv2.LINE_AA)
 
-    # ── Confidence ─────────────────────────────────────────────────────────────
+    #Model Confidence
     conf_text = f'{confidence * 100:.1f}%'
     cv2.putText(frame_out, conf_text,
                 (12, h - box_h + 58), FONT, 0.6,
                 CONF_COLOR_BGR, 1, cv2.LINE_AA)
 
-    # ── Top-3 mini bar (right side) ───────────────────────────────────────────
+    #Top-3 mini bar (right side) 
     bar_x = w - 240
     for rank, (cls, score) in enumerate(top3):
         bar_y    = h - box_h + 18 + rank * 24
@@ -180,29 +180,16 @@ def draw_overlay(frame_bgr: np.ndarray, label: str, confidence: float, top3: lis
 
 
 def annotate_video(
-    model_dir: str,
-    input_path: str,
-    output_path: str = '',
-    interval_sec: float = 1.0,
-    num_frames: int = 16,
-    model_class: str = 'timesformer',
+    model_dir: str, #Path to the best_model/ directory
+    input_path: str, #Path to the source video file
+    output_path: str = '', #Where to save the annotated video. Auto-named if empty.
+    interval_sec: float = 1.0, #Seconds between prediction updates (default: 1.0).
+    num_frames: int = 16, #Frames sampled per segment for inference (default: 16).
+    model_class: str = 'timesformer', #'timesformer' or 'videomae' (default: 'timesformer'
 ):
-    """
-    Annotate a video with sliding-window distraction predictions.
+    """Annotate a video with sliding-window distraction predictions."""
 
-    Parameters
-    ----------
-    model_dir    : Path to the best_model/ directory (model.safetensors + config.json).
-    input_path   : Path to the source video file.
-    output_path  : Where to save the annotated video. Auto-named if empty.
-    interval_sec : Seconds between prediction updates (default: 1.0).
-    num_frames   : Frames sampled per segment for inference (default: 16).
-    model_class  : 'timesformer' or 'videomae' (default: 'timesformer').
-
-    Returns
-    -------
-    str : Path to the saved output video.
-    """
+    
     if not output_path:
         base, ext = os.path.splitext(input_path)
         output_path = f'{base}_annotated{ext}'
@@ -211,10 +198,10 @@ def annotate_video(
     print(f'[INFO] Output : {output_path}')
     print(f'[INFO] Model  : {model_class} | Interval: {interval_sec}s | Frames/segment: {num_frames}')
 
-    # ── Load model ────────────────────────────────────────────────────────────
+    #Load model 
     processor, model, device = load_model(model_dir, model_class)
 
-    # ── Open video ────────────────────────────────────────────────────────────
+    #Open video 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise IOError(f'Cannot open video: {input_path}')
@@ -232,7 +219,7 @@ def annotate_video(
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out    = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # ── Process segment by segment ────────────────────────────────────────────
+    # Process segment by segment 
     seg_idx      = 0
     current_label = 'Initializing...'
     current_conf  = 0.0
@@ -273,7 +260,7 @@ def annotate_video(
     return output_path
 
 
-# ── CLI entry-point ────────────────────────────────────────────────────────────
+#CLI entry-point
 
 def parse_args():
     p = argparse.ArgumentParser(description='Annotate a video with distraction predictions.')
