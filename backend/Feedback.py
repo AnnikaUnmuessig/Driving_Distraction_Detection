@@ -152,6 +152,7 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
                 print(f"[ERROR] Failed to generate alarm beep: {beep_err}")
 
     if raw_audio_bytes:
+        print(f"[DEBUG] play_audio={play_audio}, audio_bytes size={len(raw_audio_bytes) if raw_audio_bytes else 0}")
         if play_audio:
             try:
                 wave_obj = sa.WaveObject.from_wave_file(io.BytesIO(raw_audio_bytes))

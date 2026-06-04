@@ -30,7 +30,6 @@ from pipeline import (
     ActionRecognitionWorker,
     ACTION_CONFIDENCE_THRESHOLD,
     get_action_warning_type,
-    get_wav_duration,
 )
 
 def get_wav_duration(audio_bytes: bytes) -> float:
@@ -87,10 +86,11 @@ def _update_job(job_id: str, **kwargs):
 class DetectionState:
     """Tracks driver state, debouncing, and handles warning alert cooldowns."""
     
-    def __init__(self, fps: float = 30.0, play_audio: bool = True):
+    def __init__(self, fps: float = 30.0, play_audio: bool = True, use_video_timeline: bool = False):
         """Initializes thresholds, state variables, and spawns the ActionRecognitionWorker."""
         self.fps = fps #Frames per second, used to compute time from frame count
-        self.play_audio = play_audio #whether to play audio
+        self.play_audio = play_audio #whether to play audio on the speaker
+        self.use_video_timeline = use_video_timeline #use video position for detection timing (upload); wall clock for webcam
         self.hands_off_since: Optional[float] = None #timestamp when hands were first detected off the wheel (None if currently on)
         self.last_roboflow_time: float = 0 #timestamp of last Roboflow steering wheel detection (to limit frequency)
         self.cached_steering_box: Optional[tuple] = None #use wheel box from previous detection
@@ -195,8 +195,8 @@ class DetectionState:
             except queue.Empty:
                 break
 
-        time_sec = cap_msec / 1000.0 if not self.play_audio else current_time
         video_time_sec = cap_msec / 1000.0
+        time_sec = video_time_sec if self.use_video_timeline else current_time
         logical_time = self.frame_count / self.fps
         real_time = current_time
 
@@ -543,7 +543,7 @@ def _run_upload_pipeline(job_id: str, video_path: str):
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        state = DetectionState(fps=fps, play_audio=False)
+        state = DetectionState(fps=fps, play_audio=True, use_video_timeline=True)
         with jobs_lock:
             job["detection_state"] = state
 
@@ -683,6 +683,7 @@ async def stream_upload_frames(websocket: WebSocket, job_id: str):
                             ds.videomae_enabled = enabled
                         elif target == "audio":
                             ds.voice_alerts_enabled = enabled
+                            ds.play_audio = enabled
                 elif data.get("type") == "pause":
                     with jobs_lock:
                         ds = job.get("detection_state")

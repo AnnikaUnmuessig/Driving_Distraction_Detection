@@ -13,9 +13,13 @@ from Steering_wheel_detector import detect_steering_and_hands, draw_landmarks_on
 from Feedback import generate_safety_alert_all_groq, get_ffmpeg_cmd
 from action_recognition import ActionRecognizer
 
-ACTION_OVERLAP = 30 #Minimum frames between action recognition calls
-ACTION_CONFIDENCE_THRESHOLD = 0.5 #Minimum confidence for action prediction
-EMA_ALPHA = 1.0 #Exponential moving average smoothing factor
+HANDS_OFF_THRESHOLD = 1
+WHEEL_DETECTION_INTERVAL = 1
+VIDEOMAE_WINDOW_SIZE = 16
+ACTION_OVERLAP = 30
+DEBOUNCE_THRESHOLD = 3
+ACTION_CONFIDENCE_THRESHOLD = 0.5
+EMA_ALPHA = 1.0
 
 ACTION_WARNING_MAP: dict[str, str] = {
     "texting_right"  : "heavy",
@@ -41,12 +45,12 @@ class ActionRecognitionWorker:
     def __init__(self):
         """Initializes the background worker and queue."""
         self.queue = queue.Queue(maxsize=1)
-        self.latest_result = None #stores the latest prediction result
-        self.result_lock = threading.Lock() #Protects latest_result from race conditions
-        self.running = False #Controls the worker loop
-        self.recognizer = None #The actual model wrapper
-        self.worker_thread = None #The background thread object
-        self.result_id = 0 #Monotonically increasing ID for each result to track freshness
+        self.latest_result = None
+        self.result_lock = threading.Lock()
+        self.running = False
+        self.recognizer = None
+        self.worker_thread = None
+        self.result_id = 0
         
     def start(self):
         """Initializes the recognizer and starts the worker loop thread."""
@@ -82,7 +86,7 @@ class ActionRecognitionWorker:
                 print(f"[ERROR] Action recognition error: {e}")
     
     def queue_frames(self, frames: list):
-        """Non-blocking put_nowait — silently drops the batch if the queue is full (prevents backlog)."""
+        """Adds a copy of frames to the worker queue."""
         try:
             self.queue.put_nowait(frames)
         except queue.Full:
