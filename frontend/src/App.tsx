@@ -41,8 +41,8 @@ export default function App() {
         </div>
 
         <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
-          <ConfigChip label="DEBOUNCE ×3" />
-          <ConfigChip label="1s INTERVAL" />
+          <ConfigChip label="DEBOUNCE 3/15" />
+          <ConfigChip label="HANDS 5s/2s" />
           <ConfigChip label="16F WINDOW" />
         </div>
       </div>

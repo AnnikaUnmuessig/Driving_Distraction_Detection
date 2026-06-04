@@ -25,13 +25,9 @@ from Feedback import generate_safety_alert_all_groq
 
 from pipeline import (
     build_audio_track,
-    classify_action,
     mux_audio_into_video,
     _convert_to_h264,
     ActionRecognitionWorker,
-    ACTION_OVERLAP,
-    VIDEOMAE_WINDOW_SIZE,
-    WHEEL_DETECTION_INTERVAL,
     ACTION_CONFIDENCE_THRESHOLD,
     get_action_warning_type,
     get_wav_duration,
@@ -93,57 +89,57 @@ class DetectionState:
     
     def __init__(self, fps: float = 30.0, play_audio: bool = True):
         """Initializes thresholds, state variables, and spawns the ActionRecognitionWorker."""
-        self.fps = fps
-        self.play_audio = play_audio
-        self.hands_off_since: Optional[float] = None
-        self.last_roboflow_time: float = 0
-        self.cached_steering_box: Optional[tuple] = None
-        self.frames_buffer: list = []
-        self.frame_count: int = 0
-        self.last_action_time_sec: float = 0.0
-        self.action_interval_sec: float = 1.0
-        self.last_processed_result_id: int = -1
-        self.latest_action_result_time_sec: float = 0.0
-        self.last_alert_time: float = 0.0
-        self.last_detection_result: Optional[dict] = None
-        self.confirmed_hand_state: dict = {"left": True, "right": True}
-        self.active_alert_threads: int = 0
-        self.alert_lock = threading.Lock()
-        self.alert_log: list = []
-        self.alert_log_lock = threading.Lock()
-        self.latest_action_result: Optional[dict] = None
-        self.async_events = queue.Queue()
-        self.audio_playing = False
-        self.audio_playing_lock = threading.Lock()
+        self.fps = fps #Frames per second, used to compute time from frame count
+        self.play_audio = play_audio #whether to play audio
+        self.hands_off_since: Optional[float] = None #timestamp when hands were first detected off the wheel (None if currently on)
+        self.last_roboflow_time: float = 0 #timestamp of last Roboflow steering wheel detection (to limit frequency)
+        self.cached_steering_box: Optional[tuple] = None #use wheel box from previous detection
+        self.frames_buffer: list = [] #for action recognition
+        self.frame_count: int = 0 #total frames processed
+        self.last_action_time_sec: float = 0.0 #Last time an action inference was sent
+        self.action_interval_sec: float = 1.0 #Minimum seconds between inference calls
+        self.last_processed_result_id: int = -1 #Track action result ID to avoid duplicate processing
+        self.last_detection_result: Optional[dict] = None #Cache steering box across frames
+        self.confirmed_hand_state: dict = {"left": True, "right": True} #Debounced hand state (on wheel = True)
+        self.active_alert_threads: int = 0 #Count of active alert threads (for tracking concurrent alerts)
+        self.alert_lock = threading.Lock() #Thread lock for alert operations
+        self.alert_log: list = [] #List of (timestamp, audio_bytes) tuples for final video mux
+        self.alert_log_lock = threading.Lock() #Thread lock for alert_log
+        self.latest_action_result: Optional[dict] = None #Most recent action recognition result
+        self.async_events = queue.Queue() #Queue for async event handling
+        self.audio_playing = False #Flag: audio currently playing on speaker
+        self.audio_playing_lock = threading.Lock() #Thread lock for audio_playing flag
 
-        self.same_action_cooldown: float = 5.0
-        self.diff_action_cooldown: float = 2.0
-        self.last_alert_finished_logical_time: float = 0.0
-        self.last_alert_finished_real_time: float = 0.0
-        self.last_alert_distraction_type: Optional[str] = None
+        self.same_action_cooldown: float = 5.0 #Cooldown for repeated same distraction alerts (seconds)
+        self.diff_action_cooldown: float = 2.0 #Cooldown for different distraction alerts (seconds)
+        self.last_alert_finished_real_time: float = 0.0 #Wall-clock time when last alert completed
+        self.last_alert_distraction_type: Optional[str] = None #Type of most recent alert
 
-        self.debounce_off_frames: int = 15
-        self.debounce_on_frames: int = 3
-        self.hands_off_one_hand_threshold: float = 5.0
-        self.hands_off_both_hands_threshold: float = 2.0
+        #Hands alert logic
+        self.debounce_off_frames: int = 15 #Frames that must confirm hand off wheel before state change
+        self.debounce_on_frames: int = 3 #Frames that must confirm hand on wheel before state change
+        self.hands_off_one_hand_threshold: float = 5.0 #Seconds with only one hand on wheel before alert
+        self.hands_off_both_hands_threshold: float = 2.0 #Seconds with no hands on wheel before alert
 
-        self.hand_off_frames: dict = {"left": 0, "right": 0}
-        self.hand_on_frames: dict = {"left": 0, "right": 0}
+        self.hand_off_frames: dict = {"left": 0, "right": 0} #Frames counted with hand off wheel (for debouncing)
+        self.hand_on_frames: dict = {"left": 0, "right": 0} #Frames counted with hand on wheel (for debouncing)
 
+        #EMA smoothing
         self.smoothed_probs = None
         self.ema_alpha = 0.4
 
-        self.action_persist_sec: float = 4.0
-        self.action_candidate: Optional[str] = None
-        self.action_candidate_since_sec: Optional[float] = None
-        self.action_candidate_last_seen_sec: Optional[float] = None
+        #Persistence of action
+        self.action_persist_sec: float = 4.0 #Minimum seconds an action must be continuously detected to be considered persistent
+        self.action_candidate: Optional[str] = None #The action class currently being tracked for persistence
+        self.action_candidate_since_sec: Optional[float] = None #Timestamp when the current action candidate was first seen
+        self.action_candidate_last_seen_sec: Optional[float] = None #Timestamp when the current action candidate was last seen
 
-        self.mediapipe_enabled: bool = True
-        self.videomae_enabled: bool = True
-        self.paused: bool = False
-        self.voice_alerts_enabled: bool = True
+        self.mediapipe_enabled: bool = True #Enable/disable MediaPipe hand/pose detection
+        self.videomae_enabled: bool = True #Enable/disable VideoMAE action recognition
+        self.paused: bool = False #Pause processing (WebSocket controllable)
+        self.voice_alerts_enabled: bool = True #Enable/disable voice alert generation
 
-        self.action_worker = ActionRecognitionWorker()
+        self.action_worker = ActionRecognitionWorker() #Background thread for action inference
         self.action_worker.start()
 
     def _action_candidate_stale(self, now_sec: float) -> bool:
@@ -289,7 +285,6 @@ class DetectionState:
                 result_id = action_result.get("result_id", 0)
                 if result_id > self.last_processed_result_id:
                     self.last_processed_result_id = result_id
-                    self.latest_action_result_time_sec = time_sec
 
                     raw_probs = action_result.get("probs")
                     if raw_probs and self.action_worker.recognizer:
@@ -397,7 +392,6 @@ class DetectionState:
                         return False
                     self.audio_playing = True
 
-            self.last_alert_finished_logical_time = logical_time
             self.last_alert_finished_real_time = real_time + 3.0
             self.last_alert_distraction_type = distraction_type
             self.active_alert_threads += 1
@@ -426,7 +420,6 @@ class DetectionState:
                     self.alert_log.append((video_time_sec, audio_bytes))
                 dur = get_wav_duration(audio_bytes)
             
-            self.last_alert_finished_logical_time = logical_time + dur
             self.last_alert_finished_real_time = time.time()
             self.last_alert_distraction_type = distraction_type
 
