@@ -44,11 +44,13 @@ The backend uses a multi-modal approach for comprehensive distraction detection:
 - **Binary frames**: raw JPEG bytes — render directly as `<img src={blobUrl}>`
 - **JSON messages**:
   ```json
-  { "type": "alert", "distraction_type": "hands off wheel", "severity": "mid-heavy" }
-  { "type": "alert", "distraction_type": "texting", "severity": "heavy" }
+  { "type": "alert", "distraction_type": "texting_right", "severity": "heavy", "trigger_source": "action" }
+  { "type": "alert_text", "text": "...", "distraction_type": "texting_right", "severity": "heavy", "trigger_source": "action" }
+  { "type": "hand_state", "confirmed": { "left": true, "right": false }, "pending_count": 0 }
   { "type": "done" }
   { "type": "error", "message": "Cannot open camera 0" }
   ```
+- **Client → server toggles**: `{ "type": "toggle", "target": "mediapipe"|"videomae"|"audio", "enabled": true }`
 
 ---
 
@@ -68,20 +70,22 @@ pip install -r requirements.txt
 # - models/video_mae/model.safetensors
 
 # Copy your existing pipeline modules into backend/
-# Required: Steering_wheel_detector.py, Feedback.py, pipeline.py
-# pipeline.py must export: build_audio_track, classify_action, mux_audio_into_video,
-#   ACTION_OVERLAP, DEBOUNCE_THRESHOLD, HANDS_OFF_THRESHOLD,
-#   VIDEOMAE_WINDOW_SIZE, WHEEL_DETECTION_INTERVAL, ACTION_CONFIDENCE_THRESHOLD
+# Required: Steering_wheel_detector.py, Feedback.py, pipeline.py, action_recognition.py
+# pipeline.py exports (used by main.py): build_audio_track, mux_audio_into_video,
+#   ActionRecognitionWorker, ACTION_CONFIDENCE_THRESHOLD, get_action_warning_type
 
 # Set environment variables (create backend/.env)
-echo "ROBOFLOW_API=your_api_key_here" > .env
+# GROQ_API_KEY — LLM voice alert text; ROBOFLOW_API — steering wheel detection
+echo "GROQ_API_KEY=your_key_here" > .env
+echo "ROBOFLOW_API=your_key_here" >> .env
 
 # Run
 uvicorn main:app --reload --port 8000
 ```
 
-Your existing `pipeline.py` constants and helpers are imported directly — no changes needed.
-Just make sure `pipeline.py` is in the same directory as `main.py`, or installed as a package.
+`main.py` owns live detection timing and alert rules in `DetectionState`.
+`pipeline.py` still provides audio muxing, `ActionRecognitionWorker`, and severity mapping;
+its standalone CLI script uses older constants (see below).
 
 ---
 
@@ -134,33 +138,51 @@ in concurrent async tasks (upload in a thread pool, webcam in async tasks).
 
 ---
 
-## Adapting pipeline.py for import
+## Detection & alert tuning
 
-Extract the constants and helpers from your existing `pipeline.py` so they can be imported:
+The **FastAPI app** (`main.py` → `DetectionState`) is what upload and webcam use. Tune these in `DetectionState.__init__`:
+
+| Setting | Default | Role |
+|--------|---------|------|
+| `action_interval_sec` | `1.0` | Min seconds between VideoMAE inference calls (UI: Interval dropdown) |
+| `action_persist_sec` | `4.0` | Seconds a warning-worthy action must persist before an action alert fires |
+| `ACTION_CONFIDENCE_THRESHOLD` | `0.5` | Imported from `pipeline.py`; min smoothed confidence for action tracking |
+| `debounce_on_frames` | `3` | Consecutive frames to confirm hand **on** wheel |
+| `debounce_off_frames` | `15` | Consecutive frames to confirm hand **off** wheel |
+| `hands_off_one_hand_threshold` | `5.0` | Seconds with one hand off before hands-off alert |
+| `hands_off_both_hands_threshold` | `2.0` | Seconds with both hands off before hands-off alert |
+| `same_action_cooldown` | `5.0` | Wall-clock seconds between alerts for the **same** distraction |
+| `diff_action_cooldown` | `2.0` | Wall-clock seconds between alerts for **different** distractions |
+| `ema_alpha` | `0.4` | EMA smoothing weight for action class probabilities |
+| Roboflow re-detect interval | `30.0` s | Steering wheel box refresh (`last_roboflow_time` in `process_frame`) |
+| VideoMAE window size | `16` frames | Hard-coded sample count in `process_frame` |
+
+**Alert logic (upload & webcam):**
+
+- **Action alert**: warning-worthy class above confidence, persisted for `action_persist_sec`.
+- **Hands-off alert**: only if current action is `safe_driving` (or no recent action); suppressed while a warning-worthy action is being tracked.
+- **Voice toggle**: `voice_alerts_enabled` + `play_audio` only (does not disable VideoMAE).
+- **Upload timing**: `use_video_timeline=True` so detection uses video position, independent of speaker playback.
+
+### `pipeline.py` (legacy CLI script only)
+
+These module-level constants still exist for the standalone `pipeline.py` video script, **not** for `main.py`:
 
 ```python
-# pipeline.py — make sure these are importable at module level
-HANDS_OFF_THRESHOLD = 1              # Seconds before "hands off wheel" alert
-WHEEL_DETECTION_INTERVAL = 1         # Frames between steering wheel checks
-VIDEOMAE_WINDOW_SIZE = 16            # Frames per action classification window
-ACTION_OVERLAP = 8                   # Overlap between consecutive windows
-DEBOUNCE_THRESHOLD = 3               # Frames to debounce hand state changes
-ACTION_CONFIDENCE_THRESHOLD = 0.6    # Min confidence for action alerts
+HANDS_OFF_THRESHOLD = 1
+WHEEL_DETECTION_INTERVAL = 1
+VIDEOMAE_WINDOW_SIZE = 16
+ACTION_OVERLAP = 30
+DEBOUNCE_THRESHOLD = 3
+ACTION_CONFIDENCE_THRESHOLD = 0.5
+```
 
-def classify_action(frames_buffer): 
-    """Classify driver action/distraction from frame buffer using VideoMAE."""
-    ...
+Shared helpers imported by `main.py`:
 
-def build_audio_track(alert_log, total_duration_seconds): 
-    """Generate audio track from alert log."""
-    ...
-
-def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_duration_seconds): 
-    """Combine video with audio track."""
-    ...
-
-def get_action_warning_type(action):
-    """Return severity level ('light', 'mid', 'heavy') for action, or None if safe."""
-    ...
+```python
+def build_audio_track(alert_log, total_duration_seconds): ...
+def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_duration_seconds): ...
+def get_action_warning_type(predicted_class: str) -> str | None: ...
+class ActionRecognitionWorker: ...
 ```
 
