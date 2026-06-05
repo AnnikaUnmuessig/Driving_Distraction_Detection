@@ -50,10 +50,11 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
     warning_text = None
     raw_audio_bytes = None
 
+    #Action mapping to increase LLMs understanding of distraction and response quality
     action_map = {
         "drinking": "drinking a beverage",
         "radio": "adjusting the radio",
-        "hair_and_makeup": "fixing hair or makeup",
+        "hair_and_makeup": "fixing hair",
         "texting_right": "texting with their right hand",
         "texting_left": "texting with their left hand",
         "phonecall_right": "making a phone call with their right hand",
@@ -67,6 +68,7 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
 
     if groq_client:
         try:
+            #Prompt engineering to get specific, content-rich warnings
             llm_response = groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
@@ -94,6 +96,7 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
             print(f"[WARN] Groq LLM failed: {e}")
 
     if warning_text and generate_audio:
+        # MacOS TTS: concatenative TTS
         if os.name != 'nt':
             try:
                 tmp = tempfile.NamedTemporaryFile(suffix=".aiff", delete=False)
@@ -113,6 +116,7 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
             except Exception as e:
                 print(f"[WARN] macOS say TTS failed: {e}")
 
+        # Windows TTS fallback using PowerShell and System.Speech
         else:
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
@@ -129,6 +133,7 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
             except Exception as ps_err:
                 print(f"[ERROR] Offline Windows TTS failed: {ps_err}")
 
+        #Fallback beep alarm if TTS fails
         if not raw_audio_bytes:
             print("[INFO] Generating fallback alarm beep.")
             try:
@@ -151,8 +156,9 @@ def generate_safety_alert_all_groq(distraction_output, warning_type: str = "mode
             except Exception as beep_err:
                 print(f"[ERROR] Failed to generate alarm beep: {beep_err}")
 
+    #Alert playback and latency logging
     if raw_audio_bytes:
-        print(f"[DEBUG] play_audio={play_audio}, audio_bytes size={len(raw_audio_bytes) if raw_audio_bytes else 0}")
+        #print(f"[DEBUG] play_audio={play_audio}, audio_bytes size={len(raw_audio_bytes) if raw_audio_bytes else 0}")
         if play_audio:
             try:
                 wave_obj = sa.WaveObject.from_wave_file(io.BytesIO(raw_audio_bytes))

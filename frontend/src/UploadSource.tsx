@@ -22,7 +22,6 @@ export function UploadSource() {
   const [videomaeOn, setVideomaeOn] = useState(true);
   const [voiceOn, setVoiceOn] = useState(true);
   const [isPaused, setIsPaused] = useState(false);
-  const [actionInterval, setActionInterval] = useState(1.0);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const wsUrl = job ? `${API_WS}/stream/upload/${job.job_id}` : null;
@@ -46,7 +45,6 @@ export function UploadSource() {
     setMediapipeOn(true);
     setVideomaeOn(true);
     setVoiceOn(true);
-    setActionInterval(1.0);
     await upload(file);
   };
 
@@ -58,7 +56,6 @@ export function UploadSource() {
     setMediapipeOn(true);
     setVideomaeOn(true);
     setVoiceOn(true);
-    setActionInterval(1.0);
   };
 
   const isRunning = job && (job.status === "queued" || job.status === "processing");
@@ -96,21 +93,6 @@ export function UploadSource() {
               setVoiceOn(next);
               sendMessage({ type: "toggle", target: "audio", enabled: next });
             }} />
-            <select
-              value={actionInterval}
-              onChange={(e) => {
-                const val = Number(e.target.value);
-                setActionInterval(val);
-                sendMessage({ type: "config", key: "action_interval", value: val });
-              }}
-              style={selectStyle}
-              disabled={streamStatus !== "streaming"}
-            >
-              <option value={0.5}>Interval: 0.5s</option>
-              <option value={1.0}>Interval: 1.0s</option>
-              <option value={1.5}>Interval: 1.5s</option>
-              <option value={2.0}>Interval: 2.0s</option>
-            </select>
           </>
         )}
         {isDone && job?.job_id && (
@@ -343,14 +325,6 @@ const ghostBtnStyle: React.CSSProperties = {
   background: "transparent",
   border: "1px solid rgba(255,255,255,0.15)",
   color: "rgba(255,255,255,0.5)",
-};
-
-const selectStyle: React.CSSProperties = {
-  fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-  fontSize: 9, padding: "4px 8px", borderRadius: 4,
-  border: "1px solid rgba(255,255,255,0.15)",
-  background: "rgba(255,255,255,0.04)", color: "rgba(255,255,255,0.5)",
-  cursor: "pointer", letterSpacing: "0.04em",
 };
 
 const pauseBtnStyle: React.CSSProperties = {

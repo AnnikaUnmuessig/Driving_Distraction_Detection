@@ -3,6 +3,7 @@ This module contains the main driving distraction detection pipeline, orchestrat
 steering wheel detection, hand tracking, action recognition, and audio warning feedback.
 """
 
+#This module includes old code that partially has been moved to main.py
 import cv2
 import time
 import threading
@@ -13,8 +14,8 @@ from Steering_wheel_detector import detect_steering_and_hands, draw_landmarks_on
 from Feedback import generate_safety_alert_all_groq, get_ffmpeg_cmd
 from action_recognition import ActionRecognizer
 
-HANDS_OFF_THRESHOLD = 1
-WHEEL_DETECTION_INTERVAL = 1
+
+
 VIDEOMAE_WINDOW_SIZE = 16
 ACTION_OVERLAP = 30
 DEBOUNCE_THRESHOLD = 3
@@ -235,7 +236,7 @@ def mux_audio_into_video(silent_video_path, final_output_path, pcm_bytes, total_
         _convert_to_h264(silent_video_path, final_output_path)
         print(f"[WARN] Falling back to silent video: {final_output_path}")
 
-
+#Old version for testing the logic, NOT called in main, includes old-non-defined variables and functions
 def run_pipeline(video_path=None):
     """Runs the full steering wheel detection and action recognition pipeline on video or webcam."""
     cap = cv2.VideoCapture(video_path if video_path else 0)

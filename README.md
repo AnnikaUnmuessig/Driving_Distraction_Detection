@@ -144,7 +144,7 @@ The **FastAPI app** (`main.py` → `DetectionState`) is what upload and webcam u
 
 | Setting | Default | Role |
 |--------|---------|------|
-| `action_interval_sec` | `1.0` | Min seconds between VideoMAE inference calls (UI: Interval dropdown) |
+| `action_interval_sec` | `1.0` | Min seconds between VideoMAE inference calls (set in `DetectionState.__init__`) |
 | `action_persist_sec` | `4.0` | Seconds a warning-worthy action must persist before an action alert fires |
 | `ACTION_CONFIDENCE_THRESHOLD` | `0.5` | Imported from `pipeline.py`; min smoothed confidence for action tracking |
 | `debounce_on_frames` | `3` | Consecutive frames to confirm hand **on** wheel |
@@ -169,12 +169,14 @@ The **FastAPI app** (`main.py` → `DetectionState`) is what upload and webcam u
 These module-level constants still exist for the standalone `pipeline.py` video script, **not** for `main.py`:
 
 ```python
+"""
 HANDS_OFF_THRESHOLD = 1
 WHEEL_DETECTION_INTERVAL = 1
 VIDEOMAE_WINDOW_SIZE = 16
 ACTION_OVERLAP = 30
 DEBOUNCE_THRESHOLD = 3
 ACTION_CONFIDENCE_THRESHOLD = 0.5
+"""
 ```
 
 Shared helpers imported by `main.py`:

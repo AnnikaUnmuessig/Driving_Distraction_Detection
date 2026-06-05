@@ -24,6 +24,7 @@ models_dir = os.path.join(project_root, 'models')
 rf_api_key = os.environ.get("ROBOFLOW_API")
 rf = Roboflow(api_key=rf_api_key)
 
+#Steering wheel detection model
 project = rf.workspace().project("steering-detection-s2wqt")
 model = project.version(1).model
 
@@ -31,12 +32,14 @@ hand_options = vision.HandLandmarkerOptions(
     base_options=python.BaseOptions(model_asset_path=os.path.join(models_dir, 'hand_landmarker.task')),
     num_hands=2, min_hand_detection_confidence=0.3
 )
+#HandLandmarker for hand detection and landmark extraction
 hand_detector = vision.HandLandmarker.create_from_options(hand_options)
 
 pose_options = vision.PoseLandmarkerOptions(
     base_options=python.BaseOptions(model_asset_path=os.path.join(models_dir, 'pose_landmarker_lite.task')),
-    min_pose_detection_confidence=0.4
+    min_pose_detection_confidence=0.4 #not important
 )
+#PoseLandmarker model used for fallback
 pose_detector = vision.PoseLandmarker.create_from_options(pose_options)
 
 
@@ -58,11 +61,13 @@ def draw_landmarks_on_image(rgb_image, hand_results):
             connection_drawing_spec=hand_connection_style)
     return annotated_image
 
+#Disabled pose drawing for now, can be enabled for debugging or visualization purposes
+#Annoying
 def draw_pose_markers(bgr_image, pose_results, img_w, img_h):
     """Draws pose landmark markers on the image (disabled)."""
     return bgr_image
 
-
+#Later used in main pipeline to detect steering wheel and hand positions relative to the wheel, with pose-based fallback
 def detect_steering_and_hands(frame_or_path, steering_box=None):
     """Detects steering wheel box and hand positions relative to the wheel using Roboflow and MediaPipe."""
     if isinstance(frame_or_path, str):
@@ -128,8 +133,8 @@ def detect_steering_and_hands(frame_or_path, steering_box=None):
             detected_hands.append({
                 "hand_lms": hand_lms,
                 "raw_label": raw_label,
-                "score": score,
-                "wrist_y": wrist_y,
+                "score": score, #confidence score of hand classification (left/right) from MediaPipe
+                "wrist_y": wrist_y, 
                 "is_inside": is_inside
             })
 
@@ -137,14 +142,16 @@ def detect_steering_and_hands(frame_or_path, steering_box=None):
         labels = [h["raw_label"] for h in detected_hands]
         scores = [h["score"] for h in detected_hands]
 
-        if labels[0] != labels[1] and min(scores) > 0.75:
+        if labels[0] != labels[1] and min(scores) > 0.75: #empirical 
             for hand in detected_hands:
                 hand["label"] = "Right" if hand["raw_label"] == "Right" else "Left"
+
+        #Fallback to wrist y-coordinate if both hands detected but have same label or low confidence (common failure mode)
         else:
-            detected_hands.sort(key=lambda h: h["wrist_y"])
+            detected_hands.sort(key=lambda h: h["wrist_y"]) 
             detected_hands[0]["label"] = "Left"
             detected_hands[1]["label"] = "Right"
-
+    #If only one hand detected, assign label if confidence is high, otherwise use wrist y-coordinate as fallback (assuming typical driving position with left hand higher than right)
     elif len(detected_hands) == 1:
         hand = detected_hands[0]
         hand["label"] = "Right" if hand["raw_label"] == "Right" else "Left"
@@ -171,12 +178,13 @@ def detect_steering_and_hands(frame_or_path, steering_box=None):
             if current_status:
                 continue
 
-            side_detected = any(h.get("label") == side for h in detected_hands)
+            side_detected = any(h.get("label") == side for h in detected_hands) #If hand already detected by MediaPipe as on the wheel, skip pose-based fallback for that side to avoid false positives
             if side_detected:
                 continue
 
+            #Pose-based fallback: check if wrist landmark is visible and within steering wheel box, as a backup for hand detection failures (e.g., due to occlusion, motion blur, or unusual hand positions)
             wrist_lm = lms[POSE_WRIST_INDICES[side]]
-            if wrist_lm.visibility < POSE_VISIBILITY_THRESHOLD:
+            if wrist_lm.visibility < POSE_VISIBILITY_THRESHOLD: #defined by us
                 print(f"[Fallback] {side} wrist cannot be detected (visibility: {wrist_lm.visibility:.3f}), treated as out of box.")
                 if side == "Left": #of wrist visibility too low -> hand off box
                     left_on = False

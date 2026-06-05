@@ -24,7 +24,6 @@ export function WebcamSource() {
   const [mediapipeOn, setMediapipeOn] = useState(true);
   const [videomaeOn, setVideomaeOn] = useState(true);
   const [voiceOn, setVoiceOn] = useState(true);
-  const [actionInterval, setActionInterval] = useState(1.0);
 
   const { status, frameUrl, alerts, handState, latestVoiceAlert, connect, disconnect, sendMessage } = useVideoStream(wsUrl);
 
@@ -34,7 +33,6 @@ export function WebcamSource() {
     setMediapipeOn(true);
     setVideomaeOn(true);
     setVoiceOn(true);
-    setActionInterval(1.0);
     const url = `${API_WS}/stream/webcam?cam_index=${camIndex}`;
     setWsUrl(url);
   };
@@ -74,21 +72,6 @@ export function WebcamSource() {
             <ToggleButton label="MediaPipe" on={mediapipeOn} disabled={status !== "streaming"} onClick={toggleMediapipe} />
             <ToggleButton label="VideoMAE" on={videomaeOn} disabled={status !== "streaming"} onClick={toggleVideomae} />
             <ToggleButton label="Voice" on={voiceOn} disabled={status !== "streaming"} onClick={toggleVoice} />
-            <select
-              value={actionInterval}
-              onChange={(e) => {
-                const val = Number(e.target.value);
-                setActionInterval(val);
-                sendMessage({ type: "config", key: "action_interval", value: val });
-              }}
-              style={selectStyle}
-              disabled={status !== "streaming"}
-            >
-              <option value={0.5}>Interval: 0.5s</option>
-              <option value={1.0}>Interval: 1.0s</option>
-              <option value={1.5}>Interval: 1.5s</option>
-              <option value={2.0}>Interval: 2.0s</option>
-            </select>
           </>
         )}
         {!isStreaming && (

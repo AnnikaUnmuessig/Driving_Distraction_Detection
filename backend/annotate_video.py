@@ -1,38 +1,4 @@
-"""
-annotate_video.py
-=================
-Run sliding-window inference on a video and produce an annotated copy
-with the predicted distraction class overlaid on every frame.
-
-Supports both TimeSformer and VideoMAE checkpoints via --model_class.
-
-How it works
-------------
-The video is split into non-overlapping segments of `PREDICTION_INTERVAL_SEC`
-seconds. For each segment, NUM_FRAMES frames are sampled uniformly and passed
-to the fine-tuned model. The resulting label and confidence are drawn on every
-frame of that segment. The annotated frames are written to `OUTPUT_PATH`.
-
-Usage (command line)
---------------------
-    python annotate_video.py \\
-        --model_class timesformer \\
-        --model_dir   ./timesformer_outputs/best_model \\
-        --input       ./my_video.mp4 \\
-        --output      ./annotated.mp4 \\
-        --interval    1.0
-
-    python annotate_video.py \\
-        --model_class videomae \\
-        --model_dir   ./videomae_outputs/best_model \\
-        --input       ./my_video.mp4
-
-Usage (from a notebook cell)
------------------------------
-    from annotate_video import annotate_video
-    annotate_video(model_class='videomae', model_dir=MODEL_DIR,
-                   input_path=INPUT_VIDEO, interval_sec=1.0)
-"""
+#Used at beginning for notebook testing
 
 import os
 import argparse

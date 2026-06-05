@@ -24,11 +24,11 @@ from Steering_wheel_detector import detect_steering_and_hands, draw_landmarks_on
 from Feedback import generate_safety_alert_all_groq
 
 from pipeline import (
-    build_audio_track,
-    mux_audio_into_video,
-    _convert_to_h264,
-    ActionRecognitionWorker,
-    ACTION_CONFIDENCE_THRESHOLD,
+    build_audio_track, #function to build a PCM audio track from alert log for final video mux
+    mux_audio_into_video, #function to mux generated audio into final video output
+    _convert_to_h264, #utility to convert silent annotated video to H.264 format for compatibility
+    ActionRecognitionWorker, #background thread class for running action recognition in parallel
+    ACTION_CONFIDENCE_THRESHOLD, #variable threshold for action confidence to consider in alert logic
     get_action_warning_type,
 )
 
@@ -89,10 +89,10 @@ class DetectionState:
     def __init__(self, fps: float = 30.0, play_audio: bool = True, use_video_timeline: bool = False):
         """Initializes thresholds, state variables, and spawns the ActionRecognitionWorker."""
         self.fps = fps #Frames per second, used to compute time from frame count
-        self.play_audio = play_audio #whether to play audio on the speaker
+        self.play_audio = play_audio #whether to play audio on the speaker, default True
         self.use_video_timeline = use_video_timeline #use video position for detection timing (upload); wall clock for webcam
-        self.hands_off_since: Optional[float] = None #timestamp when hands were first detected off the wheel (None if currently on)
-        self.last_roboflow_time: float = 0 #timestamp of last Roboflow steering wheel detection (to limit frequency)
+        self.hands_off_since: Optional[float] = None #counter: used for timing (relative to frames) and comparing thresholds
+        self.last_roboflow_time: float = 0 #counter for steering wheel detector (to limit frequency)
         self.cached_steering_box: Optional[tuple] = None #use wheel box from previous detection
         self.frames_buffer: list = [] #for action recognition
         self.frame_count: int = 0 #total frames processed
@@ -110,30 +110,34 @@ class DetectionState:
         self.audio_playing = False #Flag: audio currently playing on speaker
         self.audio_playing_lock = threading.Lock() #Thread lock for audio_playing flag
 
+        #Timer that include cooldown mechanisms to prevent alert spamming
         self.same_action_cooldown: float = 5.0 #Cooldown for repeated same distraction alerts (seconds)
         self.diff_action_cooldown: float = 2.0 #Cooldown for different distraction alerts (seconds)
         self.last_alert_finished_real_time: float = 0.0 #Wall-clock time when last alert completed
         self.last_alert_distraction_type: Optional[str] = None #Type of most recent alert
 
-        #Hands alert logic
+        #State logic: debouncer to prevent flickering due to detection noise
         self.debounce_off_frames: int = 15 #Frames that must confirm hand off wheel before state change
         self.debounce_on_frames: int = 3 #Frames that must confirm hand on wheel before state change
+
+        #Alert logic: how long hand(s) must be off wheel before triggering alert
         self.hands_off_one_hand_threshold: float = 5.0 #Seconds with only one hand on wheel before alert
         self.hands_off_both_hands_threshold: float = 2.0 #Seconds with no hands on wheel before alert
 
         self.hand_off_frames: dict = {"left": 0, "right": 0} #Frames counted with hand off wheel (for debouncing)
         self.hand_on_frames: dict = {"left": 0, "right": 0} #Frames counted with hand on wheel (for debouncing)
 
-        #EMA smoothing
+        #EMA smoothing: smooth action probabilities to avoid flickering
         self.smoothed_probs = None
-        self.ema_alpha = 0.4
+        self.ema_alpha = 0.4 
 
-        #Persistence of action
+        #Persistence of action for alerting
         self.action_persist_sec: float = 4.0 #Minimum seconds an action must be continuously detected to be considered persistent
         self.action_candidate: Optional[str] = None #The action class currently being tracked for persistence
         self.action_candidate_since_sec: Optional[float] = None #Timestamp when the current action candidate was first seen
         self.action_candidate_last_seen_sec: Optional[float] = None #Timestamp when the current action candidate was last seen
 
+        #Toggles for enabling/disabling components, useful for debugging
         self.mediapipe_enabled: bool = True #Enable/disable MediaPipe hand/pose detection
         self.videomae_enabled: bool = True #Enable/disable VideoMAE action recognition
         self.paused: bool = False #Pause processing (WebSocket controllable)
@@ -142,17 +146,19 @@ class DetectionState:
         self.action_worker = ActionRecognitionWorker() #Background thread for action inference
         self.action_worker.start()
 
+    #checks the time elapsed since the action was last seen
     def _action_candidate_stale(self, now_sec: float) -> bool:
         """Checks if the tracked action candidate has not been seen recently."""
         last = self.action_candidate_last_seen_sec
         if last is None:
             return True
-        return (now_sec - last) > max(1.5, self.action_interval_sec * 2.5)
+        return (now_sec - last) > max(1.5, self.action_interval_sec * 2.5) 
 
+    #Manages the lifecycle of a "candidate" distraction based on the latest frame's inference result
     def _update_action_candidate_from_result(self, action: Optional[str], confidence: float, now_sec: float) -> None:
         """Updates the tracked action candidate or resets it if the action changes or is safe."""
-        if not action or confidence <= ACTION_CONFIDENCE_THRESHOLD:
-            self.action_candidate = None
+        if not action or confidence <= ACTION_CONFIDENCE_THRESHOLD: #If no action or confidence too low, reset candidate
+            self.action_candidate = None 
             self.action_candidate_since_sec = None
             self.action_candidate_last_seen_sec = None
             return
@@ -180,6 +186,7 @@ class DetectionState:
             self.action_candidate_since_sec = None
             self.action_candidate_last_seen_sec = None
             return None
+        #Check if candidate has persisted for required duration
         if (now_sec - self.action_candidate_since_sec) >= self.action_persist_sec:
             return self.action_candidate
         return None
@@ -196,13 +203,14 @@ class DetectionState:
                 break
 
         video_time_sec = cap_msec / 1000.0
-        time_sec = video_time_sec if self.use_video_timeline else current_time
+        time_sec = video_time_sec if self.use_video_timeline else current_time #Video timeline is used for uploaded videos to sync with video position; wall clock is used for webcam where timeline is not reliable due to possible stalls
         logical_time = self.frame_count / self.fps
         real_time = current_time
 
         action_alert_fired = False
         hand_alert_pending = None
 
+        #Mediapipe logic for hand and steering wheel detection, with debouncing and cooldowns for alert triggering, and pose-based fallback for hand detection failures
         if self.mediapipe_enabled:
             run_roboflow = False
             if time_sec - self.last_roboflow_time >= 30.0 or self.cached_steering_box is None:
@@ -226,16 +234,17 @@ class DetectionState:
             for side in ["left", "right"]:
                 is_detected_on = result[f"{side}_hand_on"]
                 if is_detected_on:
-                    self.hand_on_frames[side] += 1
+                    self.hand_on_frames[side] += 1 #Count frames with hand detected on wheel
                     self.hand_off_frames[side] = 0
                     if self.hand_on_frames[side] >= self.debounce_on_frames:
                         self.confirmed_hand_state[side] = True
                 else:
-                    self.hand_off_frames[side] += 1
+                    self.hand_off_frames[side] += 1 #Count frames with hand detected off wheel
                     self.hand_on_frames[side] = 0
                     if self.hand_off_frames[side] >= self.debounce_off_frames:
                         self.confirmed_hand_state[side] = False
 
+            #Check for state change after debouncing
             if old_state != self.confirmed_hand_state:
                 events.append({
                     "type": "hand_state",
@@ -253,6 +262,7 @@ class DetectionState:
                 left_off  = not self.confirmed_hand_state["left"]
                 right_off = not self.confirmed_hand_state["right"]
 
+                #Alert logic: if hand state change detected and meets duration thresholds, prepare alert output (but check cooldowns and active audio before firing)
                 if left_off != right_off and off_duration >= self.hands_off_one_hand_threshold:
                     hand_alert_pending = (
                         {"distracted": "yes", "distraction_type": "one hand off wheel"},
@@ -291,6 +301,8 @@ class DetectionState:
                         if self.smoothed_probs is None:
                             self.smoothed_probs = list(raw_probs)
                         else:
+
+                            #EMA smoothing
                             self.smoothed_probs = [
                                 self.ema_alpha * curr + (1.0 - self.ema_alpha) * smooth
                                 for curr, smooth in zip(raw_probs, self.smoothed_probs)
@@ -302,6 +314,8 @@ class DetectionState:
                         smoothed_confidence = self.smoothed_probs[max_idx]
 
                         sorted_indices = sorted(range(len(self.smoothed_probs)), key=lambda i: self.smoothed_probs[i], reverse=True)
+
+                        #returns last action result
                         self.latest_action_result = {
                             "predicted_class": smoothed_action,
                             "confidence": round(smoothed_confidence, 4),
@@ -337,9 +351,10 @@ class DetectionState:
                                     "trigger_source": "action",
                                 })
 
+        # Hand alert if Action is Safe Driving (priority to Action)
         if hand_alert_pending and not action_alert_fired:
             with self.audio_playing_lock:
-                audio_busy = self.audio_playing
+                audio_busy = self.audio_playing 
             if not audio_busy:
                 recent_action_active = (
                     self.action_candidate is not None
@@ -372,6 +387,7 @@ class DetectionState:
         output_frame = self._annotate(frame, w, h)
         return {"frame": output_frame, "events": events}
 
+    #Trigger alert: checks cooldowns and returns True/Falls if Alert can be fired
     def _trigger_alert(self, distraction_output, warning_type: str, logical_time: float, real_time: float, trigger_source: str, video_time_sec: float):
         """Checks cooldowns and active playback to safely initiate alert thread."""
         distraction_type = distraction_output.get("distraction_type", "distraction")
@@ -403,7 +419,8 @@ class DetectionState:
             daemon=False
         ).start()
         return True
-
+    
+    #Uses distraction output to fire alarm
     def _fire_alert(self, distraction_output, warning_type: str, logical_time: float, real_time: float, play_audio: bool, trigger_source: str, video_time_sec: float):
         """Requests alert audio generation, updates cooldowns, and plays audio."""
         distraction_type = distraction_output.get("distraction_type", "distraction")
@@ -440,6 +457,7 @@ class DetectionState:
             with self.alert_lock:
                 self.active_alert_threads -= 1
 
+    #Annotation function, inspired by annotate_video.py
     def _annotate(self, frame, w, h):
         """Draws bounding boxes, hand/pose landmarks, and prediction overlays on the frame."""
         out = frame.copy()
@@ -506,7 +524,7 @@ class DetectionState:
 
         return out
 
-
+#APP Logic, created by CLAUDE
 @app.post("/upload")
 async def upload_video(file: UploadFile = File(...)):
     """Receives a video file and schedules background pipeline processing."""
